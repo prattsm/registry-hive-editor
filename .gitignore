@@ -1,0 +1,10 @@
+# Large local test hives (don’t commit)
+sample_hives/
+out/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
