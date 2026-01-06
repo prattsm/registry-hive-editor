@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
 
-from .hive import Hive, HiveValue, decode_value
+from .hive import Hive, HiveValue
 
 
 @dataclass(frozen=True)

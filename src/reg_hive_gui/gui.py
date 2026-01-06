@@ -760,9 +760,15 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             self.load_hive(self._hive_path)
 
     def load_hive(self, path: Path) -> None:
+        try:
+            new_hive = Hive(path, write=not self._read_only)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Open Hive Failed", str(exc))
+            self.statusBar().showMessage("Failed to open hive.")
+            return
         if self._hive is not None:
             self._hive.close()
-        self._hive = Hive(path, write=not self._read_only)
+        self._hive = new_hive
         self._hive_path = path
         self._path_to_item.clear()
         self._dirty = False
@@ -1052,10 +1058,13 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         path = item.data(PATH_ROLE)
         if path is None:
             path = ""
-        prefix = f"{path}\\\\" if path else ""
-        for existing in list(self._path_to_item):
-            if existing == path or existing.startswith(prefix):
-                self._path_to_item.pop(existing, None)
+        if not path:
+            self._path_to_item.clear()
+        else:
+            prefix = f"{path}\\"
+            for existing in list(self._path_to_item):
+                if existing == path or existing.startswith(prefix):
+                    self._path_to_item.pop(existing, None)
         item.removeRows(0, item.rowCount())
         subkeys = self._hive.list_subkeys(path)
         for name in sorted(subkeys, key=str.casefold):
@@ -1116,7 +1125,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         if name_item is None:
             self._update_value_details(None)
             return
-        value_name = name_item.data(VALUE_NAME_ROLE)
+        value_name = name_item.data(VALUE_NAME_ROLE) or ""
         path = self._current_path()
         value = self._hive.get_value(path, value_name)
         self._update_value_details(value)
@@ -1361,7 +1370,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         name_item = self.values_table.item(row, 0)
         if name_item is None:
             return
-        value_name = name_item.data(VALUE_NAME_ROLE)
+        value_name = name_item.data(VALUE_NAME_ROLE) or ""
         value = self._hive.get_value(path, value_name)
         if value is None:
             QtWidgets.QMessageBox.warning(self, "Edit Failed", "Value not found.")
@@ -1395,7 +1404,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         name_item = self.values_table.item(row, 0)
         if name_item is None:
             return
-        value_name = name_item.data(VALUE_NAME_ROLE)
+        value_name = name_item.data(VALUE_NAME_ROLE) or ""
         confirm = QtWidgets.QMessageBox.question(
             self,
             "Delete Value",
