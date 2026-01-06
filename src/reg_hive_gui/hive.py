@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterator, Sequence
 
 from ._hivex import hivex
 
@@ -248,12 +248,12 @@ class Hive:
         value = None
         if hasattr(self._handle, "node_get_value"):
             value = self._handle.node_get_value(node, name)
-        if not value:
+        if value is None:
             for candidate in self._node_values(node):
                 if self._handle.value_key(candidate) == name:
                     value = candidate
                     break
-        if not value:
+        if value is None:
             return None
         value_type = _normalize_value_type(self._handle.value_type(value))
         data_raw = _normalize_value_data(self._handle.value_value(value))
