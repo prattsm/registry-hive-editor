@@ -1,10 +1,29 @@
-# Large local test hives (don’t commit)
-sample_hives/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+.env/
+
+# Distribution / build
+build/
+dist/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# App output
 out/
 
-# Python
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.mypy_cache/
+# Local data
+sample_hives/
