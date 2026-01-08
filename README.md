@@ -38,6 +38,16 @@ Optionally pass a hive path:
 ```
 python scripts/run_gui.py sample_hives/SOFTWARE
 ```
+## Create a sample SOFTWARE hive (Method A: reg save)
+To test with a real `SOFTWARE` hive from your own Windows machine, use `reg save` to create a hive-format file (not a `.reg` text export).
+
+1. Create a folder to write the export (example):
+   - `C:\Temp\hives`
+2. Open **Command Prompt** or **PowerShell** as **Administrator**.
+3. Run:
+   ```
+   reg save HKLM\SOFTWARE C:\Temp\hives\SOFTWARE /y
+   ```
 
 ## Tests
 ```
