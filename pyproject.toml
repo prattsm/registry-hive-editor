@@ -1,8 +1,62 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "reg-hive-gui"
-version = "0.1.0"
+version = "0.3.0"
+description = "A safety-focused offline Windows registry hive viewer and editor"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications :: Qt",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "PySide6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2,<2",
+    "pytest>=8.3,<9",
+    "pytest-qt>=4.4,<5",
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+registry-hive-editor = "reg_hive_gui.app:main"
+
+[project.gui-scripts]
+registry-hive-editor-gui = "reg_hive_gui.app:main"
+
+[project.urls]
+Repository = "https://github.com/prattsm/registry-hive-editor"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --strict-markers"
 testpaths = ["tests"]
+markers = [
+    "integration: requires a real registry backend",
+    "performance: scalability regression checks",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".tmp", "python-write-test"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]

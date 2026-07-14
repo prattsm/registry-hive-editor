@@ -9,10 +9,15 @@ __pycache__/
 # Distribution / build
 build/
 dist/
+build-artifacts*/
 *.egg-info/
 
 # Test / coverage
 .pytest_cache/
+.tmp/
+pytest-cache-files-*/
+python-write-test/
+tests/_tmp/
 .coverage
 
 # IDE

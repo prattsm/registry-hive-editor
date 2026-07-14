@@ -1,11 +1,11 @@
-"""Example plugin: extract Run/RunOnce keys."""
+"""Extract Run and RunOnce values from a SOFTWARE hive."""
+
 from __future__ import annotations
 
 from reg_hive_gui.hive import Hive
 
 PLUGIN_NAME = "Run Keys"
 PLUGIN_DESCRIPTION = "Extract Run and RunOnce entries from common locations."
-
 
 RUN_PATHS = [
     "Microsoft\\Windows\\CurrentVersion\\Run",
@@ -18,10 +18,7 @@ RUN_PATHS = [
 def analyze(hive: Hive) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for path in RUN_PATHS:
-        values = hive.list_values(path)
-        if not values:
-            continue
-        for value in values:
+        for value in hive.list_values(path):
             rows.append(
                 {
                     "path": path,
