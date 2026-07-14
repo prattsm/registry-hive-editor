@@ -8,10 +8,19 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .compare import DiffEntry, diff_entries_to_rows, diff_hives
+from .annotations import Annotation, AnnotationStore, utc_now
+from .binary_view import format_hex_ascii, format_match_context, parse_hex_pattern
+from .compare import DiffEntry, diff_entries_to_rows, diff_hives, summarize_diffs
 from .fileio import atomic_copy_file
 from .hive import Hive, HiveValue, RegistryType
-from .plugins import Plugin, discover_plugins, run_plugin_subprocess, user_plugin_directory
+from .plugins import (
+    Plugin,
+    discover_plugins,
+    plugin_applicability,
+    run_plugin_subprocess,
+    user_plugin_directory,
+)
+from .provenance import HiveProvenance, hash_file, inspect_hive
 from .reporting import export_rows, export_subtree
 from .validation import (
     EDITABLE_VALUE_TYPES,
@@ -39,6 +48,145 @@ class SearchResult:
     value_name: str | None = None
     value_data: str | None = None
     value_data_truncated: bool = False
+    match_offset: int | None = None
+
+
+class FileHashThread(QtCore.QThread):
+    hash_ready = QtCore.Signal(str)
+    hash_error = QtCore.Signal(str)
+    hash_progress = QtCore.Signal(int, int)
+
+    def __init__(self, path: Path, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            digest = hash_file(
+                self._path,
+                cancelled=self.isInterruptionRequested,
+                progress=self.hash_progress.emit,
+            )
+        except CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.hash_error.emit(str(exc))
+        else:
+            self.hash_ready.emit(digest)
+
+
+class HiveInformationDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget, provenance: HiveProvenance) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Hive Information")
+        self.resize(720, 480)
+        self._provenance = provenance
+        self._sha256 = "Calculating..."
+
+        form = QtWidgets.QFormLayout()
+        header = provenance.header
+        self._add_field(form, "Path", str(provenance.path))
+        self._add_field(form, "Size", f"{provenance.size:,} bytes")
+        self._add_field(form, "File modified (UTC)", provenance.modified_at.isoformat())
+        self._hash_label = self._add_field(form, "SHA-256", self._sha256)
+        self._add_field(form, "Embedded name", header.embedded_name or "(none)")
+        self._add_field(
+            form,
+            "Hive last write (UTC)",
+            header.last_write.isoformat()
+            if header.last_write is not None
+            else f"Unavailable (raw {header.last_write_raw})",
+        )
+        self._add_field(form, "Format version", f"{header.major_version}.{header.minor_version}")
+        self._add_field(form, "File type / format", f"{header.file_type} / {header.file_format}")
+        self._add_field(form, "Root cell offset", f"0x{header.root_cell_offset:08x}")
+        self._add_field(form, "Hive bins size", f"{header.hive_bins_size:,} bytes")
+        self._add_field(form, "Clustering factor", str(header.clustering_factor))
+        sequence_state = "consistent" if header.sequence_consistent else "MISMATCH (possibly unclean)"
+        self._add_field(
+            form,
+            "Sequence numbers",
+            f"{header.primary_sequence} / {header.secondary_sequence} — {sequence_state}",
+        )
+        checksum_state = "valid" if header.checksum_valid else "INVALID"
+        self._add_field(
+            form,
+            "Header checksum",
+            f"0x{header.stored_checksum:08x} ({checksum_state}; "
+            f"calculated 0x{header.calculated_checksum:08x})",
+        )
+        logs = "\n".join(str(path) for path in provenance.transaction_logs)
+        self._add_field(form, "Transaction log sidecars", logs or "None detected")
+
+        self._progress = QtWidgets.QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+
+        copy_button = QtWidgets.QPushButton("Copy Summary")
+        copy_button.clicked.connect(self._copy_summary)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addWidget(copy_button)
+        button_row.addStretch(1)
+        button_row.addWidget(buttons)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self._progress)
+        layout.addLayout(button_row)
+
+        self._hash_thread = FileHashThread(provenance.path, self)
+        self._hash_thread.hash_ready.connect(self._on_hash_ready)
+        self._hash_thread.hash_error.connect(self._on_hash_error)
+        self._hash_thread.hash_progress.connect(self._on_hash_progress)
+        self._hash_thread.start()
+
+    @staticmethod
+    def _add_field(form: QtWidgets.QFormLayout, name: str, value: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(value)
+        label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        label.setWordWrap(True)
+        form.addRow(f"{name}:", label)
+        return label
+
+    def _on_hash_ready(self, digest: str) -> None:
+        self._sha256 = digest
+        self._hash_label.setText(digest)
+        self._progress.setValue(100)
+
+    def _on_hash_error(self, message: str) -> None:
+        self._sha256 = f"Unavailable: {message}"
+        self._hash_label.setText(self._sha256)
+        self._progress.setVisible(False)
+
+    def _on_hash_progress(self, processed: int, total: int) -> None:
+        self._progress.setValue(100 if total == 0 else int(processed * 100 / total))
+
+    def _copy_summary(self) -> None:
+        info = self._provenance
+        header = info.header
+        logs = ", ".join(str(path) for path in info.transaction_logs) or "none"
+        summary = "\n".join(
+            [
+                f"Path: {info.path}",
+                f"Size: {info.size} bytes",
+                f"SHA-256: {self._sha256}",
+                f"Embedded name: {header.embedded_name}",
+                f"Header version: {header.major_version}.{header.minor_version}",
+                f"Sequences: {header.primary_sequence}/{header.secondary_sequence}",
+                f"Checksum valid: {header.checksum_valid}",
+                f"Transaction logs: {logs}",
+            ]
+        )
+        QtWidgets.QApplication.clipboard().setText(summary)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        if self._hash_thread.isRunning():
+            self._hash_thread.requestInterruption()
+            self._hash_thread.wait(2000)
+        super().closeEvent(event)
 
 
 class SearchWorker(QtCore.QObject):
@@ -54,11 +202,16 @@ class SearchWorker(QtCore.QObject):
         query: str,
         request_id: int,
         *,
+        mode: str = "text",
         max_results: int = MAX_SEARCH_RESULTS,
     ) -> None:
         super().__init__()
         self._hive_path = hive_path
+        if mode not in {"text", "hex"}:
+            raise ValueError(f"Unsupported search mode: {mode}")
+        self._mode = mode
         self._query = query.casefold()
+        self._query_bytes = parse_hex_pattern(query) if mode == "hex" else b""
         self._request_id = request_id
         self._max_results = max_results
         self._cancelled = False
@@ -89,7 +242,7 @@ class SearchWorker(QtCore.QObject):
                         cancelled = True
                         break
                     total += 1
-                    if self._query and self._query in path.casefold():
+                    if self._mode == "text" and self._query in path.casefold():
                         pending.append(SearchResult(kind="key", path=path))
                         matched += 1
                         if matched >= self._max_results:
@@ -103,10 +256,24 @@ class SearchWorker(QtCore.QObject):
                             cancelled = True
                             break
                         value_name = value.name or "(Default)"
-                        data_text = format_value_data(value)
-                        haystack = f"{value_name}\n{data_text}".casefold()
-                        if self._query in haystack:
+                        if self._mode == "hex":
+                            match_offset = value.data.find(self._query_bytes)
+                            is_match = match_offset >= 0
+                            preview = (
+                                format_match_context(
+                                    value.data, match_offset, len(self._query_bytes)
+                                )
+                                if is_match
+                                else ""
+                            )
+                            was_truncated = False
+                        else:
+                            match_offset = None
+                            data_text = format_value_data(value)
+                            haystack = f"{value_name}\n{data_text}".casefold()
+                            is_match = self._query in haystack
                             preview, was_truncated = _truncate_search_preview(data_text)
+                        if is_match:
                             pending.append(
                                 SearchResult(
                                     kind="value",
@@ -114,6 +281,7 @@ class SearchWorker(QtCore.QObject):
                                     value_name=value.name,
                                     value_data=preview,
                                     value_data_truncated=was_truncated,
+                                    match_offset=match_offset,
                                 )
                             )
                             matched += 1
@@ -455,6 +623,10 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._timeline_temp_path: Path | None = None
         self._last_diff_entries: list[DiffEntry] = []
         self._bookmarks: list[str] = []
+        self._annotations: dict[str, Annotation] = {}
+        self._annotation_store = AnnotationStore()
+        self._hive_sha256: str | None = None
+        self._annotation_hash_thread: FileHashThread | None = None
         self._bookmark_syncing = False
         self._temp_paths: list[Path] = []
         self._tree_selection_model: QtCore.QItemSelectionModel | None = None
@@ -482,7 +654,6 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             self._right_splitter_sizes = self.right_splitter.sizes()
         if self._right_splitter_sizes is not None:
             self._settings.setValue("results_sizes", self._right_splitter_sizes)
-        self._save_bookmarks()
         for path in self._temp_paths:
             try:
                 path.unlink()
@@ -493,6 +664,9 @@ class HiveMainWindow(QtWidgets.QMainWindow):
     def _create_actions(self) -> None:
         self.open_action = QtGui.QAction("Open Hive...", self)
         self.open_action.triggered.connect(self.open_hive_dialog)
+
+        self.hive_info_action = QtGui.QAction("Hive Information...", self)
+        self.hive_info_action.triggered.connect(self.show_hive_information)
 
         self.export_action = QtGui.QAction("Export Hive As...", self)
         self.export_action.triggered.connect(self.export_hive_dialog)
@@ -526,6 +700,9 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self.remove_bookmark_action = QtGui.QAction("Remove Bookmark", self)
         self.remove_bookmark_action.triggered.connect(self.remove_selected_bookmark)
 
+        self.edit_bookmark_note_action = QtGui.QAction("Edit Bookmark Note...", self)
+        self.edit_bookmark_note_action.triggered.connect(self.edit_selected_bookmark_note)
+
         self.exit_action = QtGui.QAction("Exit", self)
         self.exit_action.triggered.connect(self.close)
 
@@ -533,6 +710,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         menu = self.menuBar()
         file_menu = menu.addMenu("File")
         file_menu.addAction(self.open_action)
+        file_menu.addAction(self.hive_info_action)
         file_menu.addAction(self.read_only_action)
         file_menu.addAction(self.export_action)
         file_menu.addAction(self.export_subtree_action)
@@ -548,6 +726,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         navigate_menu.addSeparator()
         navigate_menu.addAction(self.add_bookmark_action)
         navigate_menu.addAction(self.remove_bookmark_action)
+        navigate_menu.addAction(self.edit_bookmark_note_action)
 
         view_menu = menu.addMenu("View")
         view_menu.addAction(self.timeline_action)
@@ -589,12 +768,17 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self.bookmark_remove_button.setText("-")
         self.bookmark_remove_button.setToolTip("Remove selected bookmark")
         self.bookmark_remove_button.clicked.connect(self.remove_selected_bookmark)
+        self.bookmark_note_button = QtWidgets.QToolButton()
+        self.bookmark_note_button.setText("Note")
+        self.bookmark_note_button.setToolTip("Edit note for selected bookmark")
+        self.bookmark_note_button.clicked.connect(self.edit_selected_bookmark_note)
 
         bookmarks_header = QtWidgets.QHBoxLayout()
         bookmarks_header.addWidget(QtWidgets.QLabel("Bookmarks"))
         bookmarks_header.addStretch(1)
         bookmarks_header.addWidget(self.bookmark_add_button)
         bookmarks_header.addWidget(self.bookmark_remove_button)
+        bookmarks_header.addWidget(self.bookmark_note_button)
 
         bookmarks_panel = QtWidgets.QFrame()
         bookmarks_panel.setObjectName("BookmarksPanel")
@@ -628,13 +812,17 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self.value_decoded.setPlaceholderText("Decoded view")
         self.value_raw = QtWidgets.QPlainTextEdit()
         self.value_raw.setReadOnly(True)
-        self.value_raw.setPlaceholderText("Hex / raw view")
+        self.value_raw.setPlaceholderText("Offset / hex / ASCII view")
         details_layout.addWidget(self.value_meta)
         details_layout.addWidget(QtWidgets.QLabel("Decoded"))
         details_layout.addWidget(self.value_decoded)
-        details_layout.addWidget(QtWidgets.QLabel("Hex / Raw"))
+        details_layout.addWidget(QtWidgets.QLabel("Hex / ASCII"))
         details_layout.addWidget(self.value_raw)
 
+        self.search_mode = QtWidgets.QComboBox()
+        self.search_mode.addItem("Text", "text")
+        self.search_mode.addItem("Hex Bytes", "hex")
+        self.search_mode.currentIndexChanged.connect(self._on_search_mode_changed)
         self.search_input = QtWidgets.QLineEdit()
         self.search_input.setPlaceholderText("Search keys and values...")
         self.search_input.returnPressed.connect(self._start_search)
@@ -657,6 +845,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         search_layout.setContentsMargins(8, 6, 8, 6)
         search_layout.setSpacing(8)
         search_layout.addWidget(QtWidgets.QLabel("Search"))
+        search_layout.addWidget(self.search_mode)
         search_layout.addWidget(self.search_input, 1)
         search_layout.addWidget(self.search_button)
         search_layout.addWidget(self.search_cancel_button)
@@ -735,10 +924,11 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._apply_styles()
         self.statusBar().showMessage("Open a hive to begin.")
 
-        self._load_bookmarks()
+        self._render_bookmarks()
         self._load_plugins()
 
     def _set_ui_enabled(self, enabled: bool) -> None:
+        self.hive_info_action.setEnabled(enabled)
         self.export_action.setEnabled(enabled)
         self.export_subtree_action.setEnabled(enabled)
         self.export_search_action.setEnabled(enabled and self.search_results.count() > 0)
@@ -747,6 +937,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self.tree.setEnabled(enabled)
         self.values_table.setEnabled(enabled)
         self.search_input.setEnabled(enabled)
+        self.search_mode.setEnabled(enabled)
         self.search_button.setEnabled(enabled)
         self.search_cancel_button.setEnabled(enabled and self._search_active)
         self.search_results.setEnabled(enabled)
@@ -754,10 +945,21 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self.timeline_action.setEnabled(enabled)
         self.bookmark_add_button.setEnabled(enabled)
         self.bookmark_remove_button.setEnabled(enabled)
+        self.bookmark_note_button.setEnabled(enabled)
         self.copy_path_button.setEnabled(enabled)
         self.bookmark_toggle.setEnabled(enabled)
         self.add_bookmark_action.setEnabled(enabled)
         self.remove_bookmark_action.setEnabled(enabled)
+        self.edit_bookmark_note_action.setEnabled(enabled)
+
+    def _set_annotation_ui_enabled(self, enabled: bool) -> None:
+        self.bookmark_add_button.setEnabled(enabled)
+        self.bookmark_remove_button.setEnabled(enabled)
+        self.bookmark_note_button.setEnabled(enabled)
+        self.bookmark_toggle.setEnabled(enabled)
+        self.add_bookmark_action.setEnabled(enabled)
+        self.remove_bookmark_action.setEnabled(enabled)
+        self.edit_bookmark_note_action.setEnabled(enabled)
 
     def _set_dirty(self, dirty: bool = True) -> None:
         self._dirty = dirty
@@ -851,9 +1053,13 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             return
         for plugin in self._plugins:
             label = plugin.name if plugin.trusted else f"External: {plugin.name}"
+            if plugin.target_hives:
+                label += f" [{'/'.join(plugin.target_hives)}]"
             action = QtGui.QAction(label, self)
-            source = f"\nSource: {plugin.path}"
-            action.setToolTip(f"{plugin.description}{source}")
+            applicable, reason = plugin_applicability(plugin, self._hive)
+            action.setEnabled(applicable)
+            source = f"\nVersion: {plugin.version}\nSource: {plugin.path}"
+            action.setToolTip(f"{plugin.description}\n{reason}{source}")
             action.triggered.connect(lambda _checked=False, p=plugin: self._run_plugin(p))
             self.plugins_menu.addAction(action)
         if errors:
@@ -916,11 +1122,20 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         ]
         for worker, thread in jobs:
             self._request_worker_stop(worker, thread)
+        annotation_thread = self._annotation_hash_thread
+        if annotation_thread is not None and annotation_thread.isRunning():
+            annotation_thread.requestInterruption()
         all_stopped = True
         if wait:
             for _worker, thread in jobs:
                 if thread is not None and thread.isRunning() and not thread.wait(5000):
                     all_stopped = False
+            if (
+                annotation_thread is not None
+                and annotation_thread.isRunning()
+                and not annotation_thread.wait(5000)
+            ):
+                all_stopped = False
         if not all_stopped:
             return False
 
@@ -932,6 +1147,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._compare_thread = None
         self._timeline_worker = None
         self._timeline_thread = None
+        self._annotation_hash_thread = None
         for request_id, path in list(self._search_temp_paths.items()):
             self._cleanup_temp_path(path)
             self._search_temp_paths.pop(request_id, None)
@@ -999,6 +1215,10 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             self._hive.close()
         self._hive = new_hive
         self._hive_path = path
+        self._hive_sha256 = None
+        self._annotations.clear()
+        self._bookmarks.clear()
+        self._render_bookmarks()
         self._path_to_item.clear()
         self._dirty = False
         self._edit_revision = 0
@@ -1027,9 +1247,68 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._populate_item(root_item)
         self.tree.expand(model.index(0, 0))
         self._set_ui_enabled(True)
+        self._set_annotation_ui_enabled(False)
+        self._load_plugins()
         self._update_title()
         self._update_key_info("")
-        self.statusBar().showMessage(f"Loaded hive with {new_hive.backend_name}: {path}")
+        self.statusBar().showMessage(
+            f"Loaded hive with {new_hive.backend_name}; calculating evidence SHA-256: {path}"
+        )
+        self._start_annotation_hash(path, self._hive_generation)
+
+    def _start_annotation_hash(self, path: Path, generation: int) -> None:
+        thread = FileHashThread(path, self)
+        self._annotation_hash_thread = thread
+        thread.hash_ready.connect(
+            lambda digest, job_id=generation: self._on_annotation_hash_ready(job_id, digest)
+        )
+        thread.hash_error.connect(
+            lambda message, job_id=generation: self._on_annotation_hash_error(job_id, message)
+        )
+        thread.finished.connect(lambda current=thread: self._on_annotation_hash_finished(current))
+        thread.start()
+
+    def _on_annotation_hash_ready(self, generation: int, digest: str) -> None:
+        if generation != self._hive_generation:
+            return
+        self._hive_sha256 = digest
+        try:
+            annotations = self._annotation_store.load(digest)
+        except Exception as exc:  # noqa: BLE001
+            self._annotations.clear()
+            self._bookmarks.clear()
+            self._render_bookmarks()
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Annotations Unavailable",
+                f"The annotation sidecar could not be loaded safely:\n\n{exc}",
+            )
+        else:
+            self._annotations = {annotation.path: annotation for annotation in annotations}
+            self._bookmarks = sorted(self._annotations, key=str.casefold)
+            self._render_bookmarks()
+        self._set_annotation_ui_enabled(True)
+        self._sync_bookmark_toggle(self._current_path())
+        self.statusBar().showMessage(f"Evidence identity ready: SHA-256 {digest}")
+
+    def _on_annotation_hash_error(self, generation: int, message: str) -> None:
+        if generation != self._hive_generation:
+            return
+        self.statusBar().showMessage(f"Evidence hashing failed; annotations disabled: {message}")
+
+    def _on_annotation_hash_finished(self, thread: FileHashThread) -> None:
+        if self._annotation_hash_thread is thread:
+            self._annotation_hash_thread = None
+
+    def show_hive_information(self) -> None:
+        if self._hive_path is None:
+            return
+        try:
+            provenance = inspect_hive(self._hive_path)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Hive Information Failed", str(exc))
+            return
+        HiveInformationDialog(self, provenance).exec()
 
     def export_hive_dialog(self) -> None:
         if self._hive is None or self._hive_path is None:
@@ -1045,14 +1324,16 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         try:
             if self._read_only:
                 output = atomic_copy_file(self._hive_path, path)
+                digest = hash_file(output)
             else:
                 output = self._hive.export(path)
+                digest = self._hive.last_export_sha256 or hash_file(output)
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Export Failed", str(exc))
             return
         self._exported_revision = self._edit_revision
         self._update_title()
-        self.statusBar().showMessage(f"Exported hive to {output}")
+        self.statusBar().showMessage(f"Exported hive to {output} — SHA-256 {digest}")
 
     def export_subtree_report(self) -> None:
         if self._hive is None:
@@ -1176,6 +1457,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
                     "value_name": result.value_name or "",
                     "value_data": result.value_data or "",
                     "value_data_truncated": result.value_data_truncated,
+                    "match_offset": result.match_offset,
                 }
             )
         return rows
@@ -1203,9 +1485,17 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._last_diff_entries = results
         self.export_diff_action.setEnabled(bool(results))
         rows = diff_entries_to_rows(results)
-        dialog = ResultsDialog(self, "Hive Diff", rows)
+        summary = summarize_diffs(results)
+        title = (
+            f"Hive Diff — {summary['total']} raw changes; "
+            f"{summary['probable_value_renames']} probable value renames"
+        )
+        dialog = ResultsDialog(self, title, rows)
         dialog.show()
-        self.statusBar().showMessage(f"Compare complete: {len(results)} differences")
+        self.statusBar().showMessage(
+            f"Compare complete: {summary['total']} raw changes "
+            f"({summary['probable_value_renames']} probable value renames)"
+        )
 
     def _on_compare_error(self, job_id: int, message: str) -> None:
         if job_id != self._hive_generation:
@@ -1413,14 +1703,15 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         if isinstance(value.decoded, list):
             decoded_text = "\n".join(str(item) for item in value.decoded)
         elif isinstance(value.decoded, bytes):
-            decoded_text = value.decoded.hex(" ")
+            decoded_text = "Binary or opaque data; inspect the Hex / ASCII view below."
+        elif isinstance(value.decoded, str):
+            decoded_text = value.decoded[: DETAIL_VALUE_PREVIEW_CHARS + 1]
         else:
             decoded_text = str(value.decoded)
-        raw_text = value.data.hex(" ")
         decoded_preview, decoded_truncated = _truncate_text(
             decoded_text, DETAIL_VALUE_PREVIEW_CHARS
         )
-        raw_preview, raw_truncated = _truncate_text(raw_text, DETAIL_VALUE_PREVIEW_CHARS)
+        raw_preview, raw_truncated = format_hex_ascii(value.data)
         if decoded_truncated or raw_truncated:
             meta += " | Display preview truncated; Copy Value Data retains the complete value"
             self.value_meta.setText(meta)
@@ -1453,6 +1744,34 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             return
         self._remove_bookmark(item.text())
         self._sync_bookmark_toggle(self._current_path())
+
+    def edit_selected_bookmark_note(self) -> None:
+        item = self.bookmarks_list.currentItem()
+        path = item.text() if item is not None else self._current_path()
+        annotation = self._annotations.get(path)
+        if annotation is None:
+            return
+        note, accepted = QtWidgets.QInputDialog.getMultiLineText(
+            self,
+            "Bookmark Note",
+            f"Note for {path}",
+            annotation.note,
+        )
+        if not accepted:
+            return
+        if len(note) > 10_000:
+            QtWidgets.QMessageBox.warning(
+                self, "Note Too Long", "Bookmark notes are limited to 10,000 characters."
+            )
+            return
+        self._annotations[path] = Annotation(
+            path=path,
+            note=note,
+            created_at=annotation.created_at,
+            updated_at=utc_now(),
+        )
+        self._render_bookmarks()
+        self._save_bookmarks()
 
     def _toggle_bookmark_current(self, checked: bool) -> None:
         if self._bookmark_syncing:
@@ -1736,6 +2055,13 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         query = self.search_input.text().strip()
         if not query:
             return
+        mode = str(self.search_mode.currentData())
+        if mode == "hex":
+            try:
+                parse_hex_pattern(query)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Invalid Hex Search", str(exc))
+                return
         self._search_generation += 1
         request_id = self._search_generation
         if not self._stop_search(wait=True):
@@ -1758,7 +2084,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self.search_status.setText("Searching...")
         self.statusBar().showMessage("Searching...")
         self._search_thread = QtCore.QThread(self)
-        self._search_worker = SearchWorker(snapshot_path, query, request_id)
+        self._search_worker = SearchWorker(snapshot_path, query, request_id, mode=mode)
         self._search_worker.moveToThread(self._search_thread)
         self._search_thread.started.connect(self._search_worker.run)
         self._search_worker.results_batch.connect(self._on_search_batch)
@@ -1817,6 +2143,8 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             else:
                 value_name = result.value_name or "(Default)"
                 label = f"[Value] {result.path} \\ {value_name}"
+                if result.match_offset is not None:
+                    label += f" @ 0x{result.match_offset:08X}"
                 if result.value_data:
                     label += f" = {result.value_data}"
                     if result.value_data_truncated:
@@ -1856,6 +2184,12 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self.search_status.setText("Cancelling...")
         self.statusBar().showMessage("Cancelling search...")
         self.search_cancel_button.setEnabled(False)
+
+    def _on_search_mode_changed(self) -> None:
+        if self.search_mode.currentData() == "hex":
+            self.search_input.setPlaceholderText("Exact bytes, for example: DE AD BE EF")
+        else:
+            self.search_input.setPlaceholderText("Search keys and values...")
 
     def _toggle_results(self, visible: bool) -> None:
         if visible:
@@ -1900,34 +2234,49 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         margins = layout.contentsMargins()
         return self.results_toggle.sizeHint().height() + margins.top() + margins.bottom()
 
-    def _load_bookmarks(self) -> None:
-        bookmarks = self._settings.value("bookmarks", [])
-        if isinstance(bookmarks, str):
-            bookmarks = [bookmarks]
-        if not isinstance(bookmarks, list):
-            bookmarks = []
-        self._bookmarks = [str(item) for item in bookmarks if str(item)]
+    def _render_bookmarks(self) -> None:
         self.bookmarks_list.clear()
-        self.bookmarks_list.addItems(self._bookmarks)
+        for path in self._bookmarks:
+            annotation = self._annotations.get(path)
+            item = QtWidgets.QListWidgetItem(path)
+            if annotation is not None and annotation.note:
+                item.setToolTip(annotation.note)
+            self.bookmarks_list.addItem(item)
 
     def _save_bookmarks(self) -> None:
-        self._settings.setValue("bookmarks", self._bookmarks)
+        if self._hive_sha256 is None:
+            return
+        try:
+            self._annotation_store.save(
+                self._hive_sha256,
+                [self._annotations[path] for path in self._bookmarks],
+                source_path=self._hive_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Annotation Save Failed",
+                f"Bookmarks and notes could not be saved atomically:\n\n{exc}",
+            )
 
     def _add_bookmark(self, path: str) -> None:
-        if not path or path in self._bookmarks:
+        if self._hive_sha256 is None or not path or path in self._bookmarks:
             return
+        timestamp = utc_now()
+        self._annotations[path] = Annotation(
+            path=path, created_at=timestamp, updated_at=timestamp
+        )
         self._bookmarks.append(path)
         self._bookmarks.sort(key=str.casefold)
-        self.bookmarks_list.clear()
-        self.bookmarks_list.addItems(self._bookmarks)
+        self._render_bookmarks()
         self._save_bookmarks()
 
     def _remove_bookmark(self, path: str) -> None:
         if path not in self._bookmarks:
             return
         self._bookmarks.remove(path)
-        self.bookmarks_list.clear()
-        self.bookmarks_list.addItems(self._bookmarks)
+        self._annotations.pop(path, None)
+        self._render_bookmarks()
         self._save_bookmarks()
 
     def _on_bookmark_activated(self, item: QtWidgets.QListWidgetItem) -> None:

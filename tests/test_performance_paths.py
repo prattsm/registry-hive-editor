@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from PySide6 import QtGui
 
+from reg_hive_gui.binary_view import HEX_PREVIEW_BYTES, format_hex_ascii
+from reg_hive_gui.builtin_plugins.binary_triage import (
+    MAX_SCAN_BYTES,
+    MAX_STRING_LENGTH,
+    _embedded_strings,
+)
 from reg_hive_gui.gui import LOADED_ROLE, PATH_ROLE, HiveMainWindow
 
 
@@ -43,3 +49,17 @@ def test_wide_tree_population_resolves_parent_once(qtbot) -> None:
 
     assert item.rowCount() == 2_000
     assert hive.get_node_calls == 1
+
+
+def test_large_binary_render_is_bounded_by_preview_size() -> None:
+    text, truncated = format_hex_ascii(b"A" * (10 * 1024 * 1024))
+
+    assert truncated
+    assert len(text.splitlines()) == HEX_PREVIEW_BYTES // 16
+    assert len(text) < 100_000
+
+
+def test_binary_triage_string_scan_and_output_are_bounded() -> None:
+    text = _embedded_strings(b"A" * (MAX_SCAN_BYTES * 2))
+
+    assert len(text) == MAX_STRING_LENGTH

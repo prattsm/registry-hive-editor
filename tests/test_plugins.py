@@ -13,6 +13,7 @@ from reg_hive_gui.plugins import (
     discover_plugins,
     execute_plugin,
     normalize_plugin_rows,
+    plugin_applicability,
     run_plugin_subprocess,
 )
 
@@ -62,8 +63,14 @@ def test_builtin_plugins_are_packaged_and_discoverable() -> None:
     plugins, errors = discover_plugins([(plugin_dir, True)])
 
     assert not errors
-    assert {plugin.name for plugin in plugins} == {"Run Keys", "Services", "UserAssist"}
+    assert {plugin.name for plugin in plugins} == {
+        "Binary Triage",
+        "Run Keys",
+        "Services",
+        "UserAssist",
+    }
     assert all(plugin.trusted for plugin in plugins)
+    assert all(plugin.version for plugin in plugins)
 
 
 @pytest.mark.parametrize(
@@ -196,3 +203,49 @@ def test_plugin_subprocess_can_be_cancelled(
             timeout_seconds=10,
             cancelled=lambda: True,
         )
+
+
+def test_literal_plugin_target_metadata_controls_applicability(workspace_tmp_path: Path) -> None:
+    plugin_path = workspace_tmp_path / "targeted.py"
+    plugin_path.write_text(
+        "\n".join(
+            [
+                "PLUGIN_NAME = 'Targeted'",
+                "PLUGIN_DESCRIPTION = 'Example'",
+                "PLUGIN_VERSION = '2.0'",
+                "PLUGIN_TARGET_HIVES = ('SYSTEM',)",
+                "PLUGIN_REQUIRED_PATHS = ('Select', 'ControlSet001\\\\Services')",
+                "def analyze(hive): return []",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    [plugin], errors = discover_plugins([workspace_tmp_path])
+
+    class PathHive:
+        @staticmethod
+        def get_node(path: str) -> int | None:
+            return 1 if path == "Select" else None
+
+    assert not errors
+    assert plugin.version == "2.0"
+    assert plugin.target_hives == ("SYSTEM",)
+    assert plugin.required_paths == ("Select", "ControlSet001\\Services")
+    assert plugin_applicability(plugin, PathHive())[0]
+    assert not plugin_applicability(plugin, None)[0]
+
+
+def test_binary_triage_helpers_are_bounded_and_identify_common_content() -> None:
+    from reg_hive_gui.builtin_plugins.binary_triage import (
+        MAX_SCAN_BYTES,
+        MAX_STRINGS,
+        _embedded_strings,
+        _entropy,
+        _signature,
+    )
+
+    data = b"MZ" + b"printable-string\x00" * (MAX_STRINGS + 5)
+
+    assert _signature(data) == "Windows executable (MZ)"
+    assert 0 <= _entropy(data[:MAX_SCAN_BYTES]) <= 8
+    assert len(_embedded_strings(data).split(" | ")) <= MAX_STRINGS

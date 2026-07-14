@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reg-hive-gui"
-version = "0.3.0"
+version = "0.4.0"
 description = "A safety-focused offline Windows registry hive viewer and editor"
 readme = "README.md"
 license = "MIT"
@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
@@ -48,6 +49,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"
 testpaths = ["tests"]
+norecursedirs = ["tests/_tmp", "build", "dist", ".venv"]
 markers = [
     "integration: requires a real registry backend",
     "performance: scalability regression checks",

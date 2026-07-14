@@ -94,15 +94,19 @@ def make_export_hive(source: Path, handle: CommitHandle, *, write: bool = True) 
     return hive
 
 
-def test_hive_export_is_atomic_and_validates_signature(workspace_tmp_path: Path) -> None:
+def test_hive_export_is_atomic_and_validates_signature(
+    workspace_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = workspace_tmp_path / "source"
     source.write_bytes(b"regforiginal")
     output = workspace_tmp_path / "output"
     output.write_bytes(b"existing")
     hive = make_export_hive(source, CommitHandle())
+    monkeypatch.setattr(Hive, "_validate_exported_hive", staticmethod(lambda _path: None))
 
     assert hive.export(output) == output
     assert output.read_bytes() == b"regfvalid"
+    assert hive.last_export_sha256 == "c0fd15815def383f157178f2d882b0b3a47d3ca8575c289edbb45732ea90275b"
 
 
 @pytest.mark.parametrize(
@@ -110,18 +114,40 @@ def test_hive_export_is_atomic_and_validates_signature(workspace_tmp_path: Path)
     [CommitHandle(error=OSError("commit failed")), CommitHandle(payload=b"not-a-hive")],
 )
 def test_failed_hive_export_preserves_existing_destination(
-    workspace_tmp_path: Path, handle: CommitHandle
+    workspace_tmp_path: Path, handle: CommitHandle, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = workspace_tmp_path / "source"
     source.write_bytes(b"regforiginal")
     output = workspace_tmp_path / "output"
     output.write_bytes(b"existing")
     hive = make_export_hive(source, handle)
+    monkeypatch.setattr(Hive, "_validate_exported_hive", staticmethod(lambda _path: None))
 
     with pytest.raises(OSError):
         hive.export(output)
 
     assert output.read_bytes() == b"existing"
+
+
+def test_reopen_validation_failure_preserves_existing_destination(
+    workspace_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = workspace_tmp_path / "source"
+    output = workspace_tmp_path / "output"
+    source.write_bytes(b"regforiginal")
+    output.write_bytes(b"existing")
+    hive = make_export_hive(source, CommitHandle())
+
+    def fail_validation(_path: Path) -> None:
+        raise OSError("simulated structural failure")
+
+    monkeypatch.setattr(Hive, "_validate_exported_hive", staticmethod(fail_validation))
+
+    with pytest.raises(OSError, match="simulated structural failure"):
+        hive.export(output)
+
+    assert output.read_bytes() == b"existing"
+    assert not list(workspace_tmp_path.glob(".output.*.tmp"))
 
 
 def test_hive_export_rejects_input_and_read_only_mode(workspace_tmp_path: Path) -> None:
