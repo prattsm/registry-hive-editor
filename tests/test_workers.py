@@ -120,6 +120,28 @@ def test_search_limit_and_value_preview_bound_result_memory(
     assert completions == [(11, False, True, 3, 3)]
 
 
+def test_hex_search_matches_raw_bytes_and_reports_offset(
+    workspace_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BinarySearchHive(SearchHive):
+        def iter_values_for_node(self, _node: int):
+            yield HiveValue("Blob", RegistryType.REG_BINARY, b"prefix\xde\xad\xbe\xef", b"")
+
+    monkeypatch.setattr(gui, "Hive", BinarySearchHive)
+    batches: list[tuple[int, list[gui.SearchResult]]] = []
+    worker = SearchWorker(
+        workspace_tmp_path / "snapshot", "DE AD BE EF", 12, mode="hex"
+    )
+    worker.results_batch.connect(lambda *args: batches.append(args))
+
+    worker.run()
+
+    result = batches[0][1][0]
+    assert result.kind == "value"
+    assert result.match_offset == 6
+    assert "de ad be ef" in (result.value_data or "")
+
+
 def test_cancelled_timeline_finishes_without_emitting_rows(
     workspace_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

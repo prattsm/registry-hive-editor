@@ -7,13 +7,16 @@ Windows.
 ## Capabilities
 
 - Open SYSTEM, SOFTWARE, SAM, SECURITY, NTUSER.DAT, and other offline hives.
-- Browse keys lazily and inspect decoded plus raw value data.
-- Search in a cancellable background job with incremental results.
+- Browse keys lazily and inspect decoded data plus a bounded offset/hex/ASCII view.
+- Search text or exact hex bytes in a cancellable background job with incremental results.
 - Create/delete keys and create/edit/delete supported values in an in-memory working copy.
 - Export edited hives to a separate, atomically replaced output file.
 - Export subtree, search, timeline, plugin, and comparison reports as JSON or CSV.
-- Compare large hives with a bounded-memory, case-insensitive SQLite index.
-- Run three packaged analysis plugins or explicitly approved external plugins.
+- Compare large hives with a bounded-memory, case-insensitive SQLite index, probable value-rename
+  correlation, and changed-byte ranges.
+- Inspect hive header health, SHA-256 identity, and adjacent transaction-log sidecars.
+- Keep per-evidence bookmarks and notes in atomic sidecars keyed by the hive SHA-256.
+- Run four packaged, hive-aware analysis plugins or explicitly approved external plugins.
 
 Every session starts read-only. Key rename and editing of opaque registry types are deliberately
 disabled where metadata-preserving behavior cannot be guaranteed. See [the safety model](docs/SAFETY.md).
@@ -23,13 +26,13 @@ disabled where metadata-preserving behavior cannot be guaranteed. See [the safet
 Requirements:
 
 - 64-bit Windows 10/11 or a supported Windows Server release
-- Python 3.11 or newer
+- Python 3.11 through 3.14
 - `%SystemRoot%\System32\offreg.dll` (present on current supported Windows images)
 
 In PowerShell from the repository folder:
 
 ```powershell
-py -3.12 -m venv .venv
+py -3.14 -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip
 & .\.venv\Scripts\python.exe -m pip install -e .
 & .\.venv\Scripts\registry-hive-editor-gui.exe
@@ -64,12 +67,13 @@ python3 -m venv --system-site-packages .venv
 
 ## Safe edit workflow
 
-1. Preserve and hash the original hive with your approved evidence tool.
+1. Preserve and hash the original hive with your approved evidence tool. Use **Hive Information**
+   to record the app's SHA-256 and header-health view as a second reference.
 2. Open it; the app starts read-only.
 3. If editing is required, uncheck **Read-only Mode** and accept the warning.
 4. Make changes in the in-memory working copy.
 5. Choose **Export Hive As** and select a different output path.
-6. Reopen and independently validate/hash the exported hive.
+6. Record the SHA-256 displayed after export and independently validate/hash the exported hive.
 
 Exports reject the original path and hard links to it. A staging file is flushed and validated
 before it atomically replaces the selected destination, so a failed write does not destroy an
@@ -92,9 +96,15 @@ Built-ins are packaged under `reg_hive_gui/builtin_plugins`. External plugins ar
 - Windows: `%LOCALAPPDATA%\RegistryHiveEditor\plugins`
 - Linux: `${XDG_CONFIG_HOME:-~/.config}/reg_hive_gui/plugins`
 
-Discovery parses source without executing it. The app asks before every external plugin run and
-executes it in a time-limited child process. That process is not an OS sandbox; only run trusted
+Discovery parses source without executing it. Plugins can declare versions, intended hive types,
+and identifying paths; nonmatching analyzers are disabled for the open hive. The app asks before
+every external plugin run and executes it in a time-limited child process. That process is not an
+OS sandbox; only run trusted
 code. See [the plugin API](docs/PLUGINS.md).
+
+Bookmark sidecars are stored under `%LOCALAPPDATA%\RegistryHiveEditor\annotations` on Windows (or
+`${XDG_CONFIG_HOME:-~/.config}/reg_hive_gui/annotations` on Linux). They never modify the evidence
+hive and are loaded only when the full SHA-256 matches.
 
 ## Development and tests
 
@@ -109,7 +119,7 @@ python -m build
 Windows test runs create synthetic hives through Offreg and verify create/open/edit/export/reopen,
 recursive deletion, corrupt-input rejection, source immutability, and plugin subprocess access. No
 real registry evidence is stored in the repository. The CI matrix covers Windows and Ubuntu on
-Python 3.11–3.13. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Python 3.11–3.14. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Backend references
 

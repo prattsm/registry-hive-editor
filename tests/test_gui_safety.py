@@ -158,6 +158,23 @@ def test_dirty_close_can_be_cancelled(qtbot, monkeypatch: pytest.MonkeyPatch) ->
     window._set_dirty(False)
 
 
+def test_close_does_not_create_an_unchanged_annotation_sidecar(
+    qtbot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = HiveMainWindow()
+    qtbot.addWidget(window)
+    monkeypatch.setattr(
+        window,
+        "_save_bookmarks",
+        lambda: (_ for _ in ()).throw(AssertionError("unchanged annotations must not be saved")),
+    )
+    event = QtGui.QCloseEvent()
+
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+
+
 def test_external_plugin_decline_does_not_create_snapshot(
     qtbot, monkeypatch: pytest.MonkeyPatch
 ) -> None:

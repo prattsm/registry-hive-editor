@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import CancelledError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +34,11 @@ class DiffEntry:
     new_timestamp: datetime | None = None
     old_timestamp_raw: int | None = None
     new_timestamp_raw: int | None = None
+    correlation: str | None = None
+    correlated_value_name: str | None = None
+    first_changed_offset: int | None = None
+    changed_byte_count: int | None = None
+    changed_ranges: tuple[tuple[int, int], ...] = ()
 
 
 def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
@@ -249,6 +254,9 @@ def _value_diff(row: sqlite3.Row) -> DiffEntry | None:
             old_decoded=decode_value(old_type, old_data),
         )
     if old_name != new_name or old_type != new_type or old_data != new_data:
+        first_offset, changed_count, changed_ranges = _binary_change_details(
+            old_data, new_data
+        )
         return DiffEntry(
             kind="value",
             change="modified",
@@ -264,8 +272,89 @@ def _value_diff(row: sqlite3.Row) -> DiffEntry | None:
             new_data=new_data,
             old_decoded=decode_value(old_type, old_data),
             new_decoded=decode_value(new_type, new_data),
+            first_changed_offset=first_offset,
+            changed_byte_count=changed_count,
+            changed_ranges=changed_ranges,
         )
     return None
+
+
+def _binary_change_details(
+    old_data: bytes, new_data: bytes
+) -> tuple[int | None, int, tuple[tuple[int, int], ...]]:
+    """Describe differing byte positions as half-open contiguous ranges."""
+    ranges: list[tuple[int, int]] = []
+    range_start: int | None = None
+    changed_count = 0
+    for offset in range(max(len(old_data), len(new_data))):
+        changed = (
+            offset >= len(old_data)
+            or offset >= len(new_data)
+            or old_data[offset] != new_data[offset]
+        )
+        if changed:
+            changed_count += 1
+            if range_start is None:
+                range_start = offset
+        elif range_start is not None:
+            ranges.append((range_start, offset))
+            range_start = None
+    if range_start is not None:
+        ranges.append((range_start, max(len(old_data), len(new_data))))
+    first_offset = ranges[0][0] if ranges else None
+    return first_offset, changed_count, tuple(ranges)
+
+
+def correlate_probable_value_renames(entries: Iterable[DiffEntry]) -> list[DiffEntry]:
+    """Annotate unambiguous same-key/type/data remove-add pairs as probable renames."""
+    result = list(entries)
+    removed: dict[tuple[str, int, bytes], list[int]] = {}
+    added: dict[tuple[str, int, bytes], list[int]] = {}
+    for index, entry in enumerate(result):
+        if entry.kind != "value":
+            continue
+        if entry.change == "removed" and entry.old_type is not None and entry.old_data is not None:
+            key = (entry.path.casefold(), entry.old_type, entry.old_data)
+            removed.setdefault(key, []).append(index)
+        elif entry.change == "added" and entry.new_type is not None and entry.new_data is not None:
+            key = (entry.path.casefold(), entry.new_type, entry.new_data)
+            added.setdefault(key, []).append(index)
+    for key in removed.keys() & added.keys():
+        old_indexes = removed[key]
+        new_indexes = added[key]
+        if len(old_indexes) != 1 or len(new_indexes) != 1:
+            continue
+        old_index = old_indexes[0]
+        new_index = new_indexes[0]
+        old_name = result[old_index].old_value_name or ""
+        new_name = result[new_index].new_value_name or ""
+        if old_name.casefold() == new_name.casefold():
+            continue
+        result[old_index] = replace(
+            result[old_index],
+            correlation="probable_value_rename",
+            correlated_value_name=new_name,
+        )
+        result[new_index] = replace(
+            result[new_index],
+            correlation="probable_value_rename",
+            correlated_value_name=old_name,
+        )
+    return result
+
+
+def summarize_diffs(entries: Iterable[DiffEntry]) -> dict[str, int]:
+    entries_list = list(entries)
+    return {
+        "total": len(entries_list),
+        "added": sum(entry.change == "added" for entry in entries_list),
+        "removed": sum(entry.change == "removed" for entry in entries_list),
+        "modified": sum(entry.change == "modified" for entry in entries_list),
+        "probable_value_renames": sum(
+            entry.correlation == "probable_value_rename" for entry in entries_list
+        )
+        // 2,
+    }
 
 
 def diff_hives(
@@ -307,7 +396,7 @@ def diff_hives(
                 entry.change,
             )
         )
-        return diffs
+        return correlate_probable_value_renames(diffs)
     finally:
         if connection is not None:
             connection.close()
@@ -339,6 +428,13 @@ def diff_entries_to_rows(entries: Iterable[DiffEntry]) -> list[dict[str, object]
             "new_timestamp": entry.new_timestamp.isoformat() if entry.new_timestamp else "",
             "old_timestamp_raw": entry.old_timestamp_raw,
             "new_timestamp_raw": entry.new_timestamp_raw,
+            "correlation": entry.correlation or "",
+            "correlated_value_name": entry.correlated_value_name or "",
+            "first_changed_offset": entry.first_changed_offset,
+            "changed_byte_count": entry.changed_byte_count,
+            "changed_ranges": ", ".join(
+                f"0x{start:08X}-0x{end - 1:08X}" for start, end in entry.changed_ranges
+            ),
         }
         rows.append(row)
     return rows

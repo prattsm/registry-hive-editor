@@ -7,14 +7,19 @@ from reg_hive_gui.hive import Hive
 
 PLUGIN_NAME = "Example"
 PLUGIN_DESCRIPTION = "Describe what the plugin extracts."
+PLUGIN_VERSION = "1.0"
+PLUGIN_TARGET_HIVES = ("SOFTWARE",)
+PLUGIN_REQUIRED_PATHS = ("Microsoft\\Windows\\CurrentVersion",)
 
 
 def analyze(hive: Hive) -> list[dict[str, object]]:
     return [{"path": path} for path in hive.iter_keys()]
 ```
 
-`PLUGIN_NAME` and `PLUGIN_DESCRIPTION` must be literal strings so discovery can read them without
-executing the file. `analyze(hive)` receives an independently opened, read-only `Hive` and must
+All `PLUGIN_*` metadata must be literal strings or literal string sequences so discovery can read it
+without executing the file. Required paths use any-match semantics: the plugin is enabled when at
+least one is present. An empty required-path tuple applies to every open hive. `analyze(hive)`
+receives an independently opened, read-only `Hive` and must
 return a list of row dictionaries with text column names.
 
 Supported cell values are strings, numbers, booleans, `None`, bytes, dates, datetimes, mappings,
@@ -27,5 +32,6 @@ per text cell, and 120 seconds per run.
 External plugins are untrusted code. The confirmation prompt identifies their source path. The child
 process timeout limits hangs and crashes, but it does not restrict the plugin's account permissions.
 
-The package ships three examples in `reg_hive_gui/builtin_plugins`: Run Keys, Services, and
-UserAssist.
+The package ships four analyzers in `reg_hive_gui/builtin_plugins`: Binary Triage, Run Keys,
+Services, and UserAssist. Binary Triage caps rows, scanned bytes, extracted string count, and each
+string's length.

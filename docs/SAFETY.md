@@ -10,11 +10,13 @@ to a different path.
 - Enabling editing requires an explicit warning confirmation.
 - The input path, aliases of that path, and hard links to that file cannot be export targets.
 - Hive and report exports use a same-directory staging file and atomically move it into place only
-  after a successful write. A failed export leaves an existing destination intact.
+  after a successful write. Edited hive exports are structurally reopened before replacement and
+  their SHA-256 is reported. A failed export leaves an existing destination intact.
 - Closing, opening another hive, or changing mode prompts when the latest edit revision has not
   been exported.
 
-The app verifies that a backend produced a hive-format `regf` file, but this is not a substitute for
+The app verifies the `regf` signature and structurally reopens edited output with an independent
+read-only backend handle, but this is not a substitute for
 organizational evidence-handling procedures. Preserve the original evidence, record hashes with an
 approved forensic tool, and validate exported artifacts before operational use.
 
@@ -43,9 +45,15 @@ working data is first exported to a temporary snapshot. Jobs support cancellatio
 before a hive is changed or the application exits. Old job generations cannot publish results into
 a newly loaded hive.
 
-Search results are emitted incrementally and capped at 50,000 entries. The UI reports when that cap
-is reached. Large displayed values use explicit previews; deliberate copy and report operations
+Search results are emitted incrementally and capped at 50,000 entries. Exact byte search reports the
+matching offset. The UI reports when the cap is reached. Large displayed values and binary triage
+use explicit byte/string/row bounds; deliberate copy and report operations
 retain the complete formatted data.
+
+Bookmarks and notes are separate JSON files under the user's application-data directory. Each is
+named and internally identified by the complete SHA-256 of the source hive, validated on load, and
+atomically replaced. They are analysis aids rather than evidence and are not written beside or into
+the source hive.
 
 ## Plugins
 

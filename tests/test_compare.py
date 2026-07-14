@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from reg_hive_gui.compare import diff_entries_to_rows, diff_hives
+from reg_hive_gui.compare import diff_entries_to_rows, diff_hives, summarize_diffs
 from reg_hive_gui.hive import HiveTimestamp, HiveValue, RegistryType, encode_value
 
 
@@ -72,6 +72,9 @@ def test_added_removed_and_modified_data_are_reported(workspace_tmp_path: Path) 
     modified_value = next(entry for entry in diffs if entry.kind == "value" and entry.change == "modified")
     assert modified_value.old_decoded == 1
     assert modified_value.new_decoded == 2
+    assert modified_value.first_changed_offset == 0
+    assert modified_value.changed_byte_count == 1
+    assert modified_value.changed_ranges == ((0, 1),)
 
 
 def test_case_only_names_are_modifications_not_add_remove_pairs(
@@ -152,3 +155,70 @@ def test_comparison_cancellation_cleans_temporary_index(workspace_tmp_path: Path
         )
 
     assert not list(workspace_tmp_path.glob("reg_hive_compare_*.sqlite"))
+
+
+def test_unique_remove_add_pair_is_annotated_as_probable_value_rename(
+    workspace_tmp_path: Path,
+) -> None:
+    left = FakeHive({"Key": (1, [("C", RegistryType.REG_SZ, "same data")])})
+    right = FakeHive(
+        {"Key": (1, [("Changed from C to D", RegistryType.REG_SZ, "same data")])}
+    )
+
+    diffs = diff_hives(left, right, index_directory=workspace_tmp_path)
+    value_diffs = [entry for entry in diffs if entry.kind == "value"]
+
+    assert [(entry.change, entry.value_name) for entry in value_diffs] == [
+        ("removed", "C"),
+        ("added", "Changed from C to D"),
+    ]
+    assert all(entry.correlation == "probable_value_rename" for entry in value_diffs)
+    assert {entry.correlated_value_name for entry in value_diffs} == {
+        "C",
+        "Changed from C to D",
+    }
+    assert summarize_diffs(diffs)["probable_value_renames"] == 1
+
+
+def test_ambiguous_identical_values_are_not_correlated_as_renames(
+    workspace_tmp_path: Path,
+) -> None:
+    left = FakeHive(
+        {
+            "Key": (
+                1,
+                [
+                    ("Old1", RegistryType.REG_BINARY, b"same"),
+                    ("Old2", RegistryType.REG_BINARY, b"same"),
+                ],
+            )
+        }
+    )
+    right = FakeHive(
+        {
+            "Key": (
+                1,
+                [
+                    ("New1", RegistryType.REG_BINARY, b"same"),
+                    ("New2", RegistryType.REG_BINARY, b"same"),
+                ],
+            )
+        }
+    )
+
+    diffs = diff_hives(left, right, index_directory=workspace_tmp_path)
+
+    assert all(entry.correlation is None for entry in diffs)
+
+
+def test_binary_diff_reports_disjoint_offsets_and_ranges(workspace_tmp_path: Path) -> None:
+    left = FakeHive({"Key": (1, [("Blob", RegistryType.REG_BINARY, b"abcXef")])})
+    right = FakeHive({"Key": (1, [("Blob", RegistryType.REG_BINARY, b"abcYefZZ")])})
+
+    [entry] = diff_hives(left, right, index_directory=workspace_tmp_path)
+    [row] = diff_entries_to_rows([entry])
+
+    assert entry.first_changed_offset == 3
+    assert entry.changed_byte_count == 3
+    assert entry.changed_ranges == ((3, 4), (6, 8))
+    assert row["changed_ranges"] == "0x00000003-0x00000003, 0x00000006-0x00000007"

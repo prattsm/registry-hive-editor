@@ -9,6 +9,7 @@ from typing import Iterator
 
 from ._backend import load_backend
 from .fileio import staged_output
+from .provenance import hash_file
 from .validation import (
     validate_key_name,
     validate_multi_string,
@@ -162,6 +163,7 @@ class Hive:
         self._handle = backend.Hivex(str(self._path), write=write)
         self._backend_name = getattr(self._handle, "backend_name", "hivex")
         self._write = write
+        self._last_export_sha256: str | None = None
 
     @property
     def path(self) -> Path:
@@ -170,6 +172,10 @@ class Hive:
     @property
     def backend_name(self) -> str:
         return self._backend_name
+
+    @property
+    def last_export_sha256(self) -> str | None:
+        return self._last_export_sha256
 
     def close(self) -> None:
         if hasattr(self._handle, "close"):
@@ -469,4 +475,15 @@ class Hive:
                 raise OSError("Registry backend did not produce a readable hive") from exc
             if signature != b"regf":
                 raise OSError("Registry backend produced an invalid hive signature")
+            self._validate_exported_hive(temporary)
+            self._last_export_sha256 = hash_file(temporary)
         return output
+
+    @staticmethod
+    def _validate_exported_hive(path: Path) -> None:
+        try:
+            with Hive(path, write=False) as validation:
+                if validation.get_node("") is None:
+                    raise OSError("Exported hive does not contain a readable root key")
+        except Exception as exc:
+            raise OSError("Registry backend produced a hive that could not be reopened") from exc

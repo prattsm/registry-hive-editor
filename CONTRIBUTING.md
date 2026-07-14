@@ -10,7 +10,7 @@ python -m compileall -q src scripts tests
 python -m build
 ```
 
-The GitHub Actions matrix runs these checks on Windows and Ubuntu with Python 3.11, 3.12, and 3.13.
+The GitHub Actions matrix runs these checks on Windows and Ubuntu with Python 3.11 through 3.14.
 
 Tests use small in-memory backend doubles for malformed data and injected write failures. Real-hive
 tests belong under the `integration` marker and must use redistributable synthetic fixtures or
