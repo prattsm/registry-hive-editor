@@ -1,72 +1,118 @@
-# Registry Hive GUI
+# Registry Hive Editor
 
-Offline Windows registry hive viewer/editor with "hive in / hive out" safety. Designed for DFIR workflows and large hives.
+A safety-focused desktop viewer and editor for offline Windows registry hives. It runs natively on
+Windows through Microsoft's Offline Registry Library—WSL, Linux, and `hivex` are not required on
+Windows.
 
-## Features
-- Load offline hives (SYSTEM, SOFTWARE, SAM, SECURITY, NTUSER.DAT, etc.)
-- Tree + values view with fast search
-- Create/rename/delete keys and values
-- Decoded and hex/raw value views
-- Bookmarks, jump-to-path, copy path
-- Export reports (search results, subtree) as JSON/CSV
-- Compare two hives and export diff report
-- Timeline view (key last-write times)
-- Plugin hooks with sample plugins
-- Read-only mode
+## Capabilities
 
-## Requirements
-- Python 3.11+
-- PySide6
-- hivex bindings (system package recommended)
+- Open SYSTEM, SOFTWARE, SAM, SECURITY, NTUSER.DAT, and other offline hives.
+- Browse keys lazily and inspect decoded plus raw value data.
+- Search in a cancellable background job with incremental results.
+- Create/delete keys and create/edit/delete supported values in an in-memory working copy.
+- Export edited hives to a separate, atomically replaced output file.
+- Export subtree, search, timeline, plugin, and comparison reports as JSON or CSV.
+- Compare large hives with a bounded-memory, case-insensitive SQLite index.
+- Run three packaged analysis plugins or explicitly approved external plugins.
 
-### Install dependencies
-Recommended on Ubuntu/WSL:
+Every session starts read-only. Key rename and editing of opaque registry types are deliberately
+disabled where metadata-preserving behavior cannot be guaranteed. See [the safety model](docs/SAFETY.md).
+
+## Native Windows setup
+
+Requirements:
+
+- 64-bit Windows 10/11 or a supported Windows Server release
+- Python 3.11 or newer
+- `%SystemRoot%\System32\offreg.dll` (present on current supported Windows images)
+
+In PowerShell from the repository folder:
+
+```powershell
+py -3.12 -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv\Scripts\python.exe -m pip install -e .
+& .\.venv\Scripts\registry-hive-editor-gui.exe
 ```
+
+You can also run:
+
+```powershell
+& .\.venv\Scripts\python.exe -m reg_hive_gui
+& .\.venv\Scripts\python.exe -m reg_hive_gui C:\Temp\hives\SOFTWARE
+```
+
+For PyCharm, open the repository folder and select
+`.venv\Scripts\python.exe` as the project interpreter. Run the `reg_hive_gui` module or
+`scripts\run_gui.py`.
+
+The Windows backend loads `offreg.dll` only from the trusted System32 location. Microsoft's library
+opens and validates the input into memory; changes do not persist until the app saves a new hive.
+Microsoft documents a less-than-4-GB input limit for `OROpenHive`.
+
+## Linux setup
+
+Non-Windows systems continue to use the `hivex` Python binding:
+
+```bash
 sudo apt-get update
 sudo apt-get install -y python3-hivex libhivex0
-python -m pip install PySide6
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/registry-hive-editor
 ```
 
-Note: `pip install hivex` may fail on some systems. The app uses the system `python3-hivex` package via a shim in `src/reg_hive_gui/_hivex.py`.
+## Safe edit workflow
 
-## Run
-From the repo root:
-```
-python scripts/run_gui.py
-```
-Optionally pass a hive path:
-```
-python scripts/run_gui.py sample_hives/SOFTWARE
-```
-## Create a sample SOFTWARE hive
-To test with a real `SOFTWARE` hive from your own Windows machine, use `reg save` to create a hive-format file (not a `.reg` text export).
+1. Preserve and hash the original hive with your approved evidence tool.
+2. Open it; the app starts read-only.
+3. If editing is required, uncheck **Read-only Mode** and accept the warning.
+4. Make changes in the in-memory working copy.
+5. Choose **Export Hive As** and select a different output path.
+6. Reopen and independently validate/hash the exported hive.
 
-1. Create a folder to write the export (example):
-   - `C:\Temp\hives`
-2. Open **Command Prompt** or **PowerShell** as **Administrator**.
-3. Run:
-   ```
-   reg save HKLM\SOFTWARE C:\Temp\hives\SOFTWARE /y
-   ```
+Exports reject the original path and hard links to it. A staging file is flushed and validated
+before it atomically replaces the selected destination, so a failed write does not destroy an
+existing output file.
 
-## Tests
+To make a test SOFTWARE hive from the active registry, open an elevated PowerShell or Command
+Prompt and run:
+
+```powershell
+New-Item -ItemType Directory -Force C:\Temp\hives
+reg save HKLM\SOFTWARE C:\Temp\hives\SOFTWARE /y
 ```
-python -m pip install pytest
-python -m pytest -q
-```
+
+This produces a binary hive. A `.reg` text export is not a hive and cannot be opened.
 
 ## Plugins
-Plugins are Python files exposing:
-- `PLUGIN_NAME` (optional)
-- `PLUGIN_DESCRIPTION` (optional)
-- `analyze(hive: Hive) -> list[dict]`
 
-Search paths:
-- `./plugins/*.py`
-- `~/.config/reg_hive_gui/plugins/*.py`
+Built-ins are packaged under `reg_hive_gui/builtin_plugins`. External plugins are discovered at:
 
-Sample plugins are included in `plugins/`.
+- Windows: `%LOCALAPPDATA%\RegistryHiveEditor\plugins`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/reg_hive_gui/plugins`
 
-## Notes
-- The input hive is never overwritten. Export always writes to a new path.
-- Read-only mode disables editing (safe for triage/review).
+Discovery parses source without executing it. The app asks before every external plugin run and
+executes it in a time-limited child process. That process is not an OS sandbox; only run trusted
+code. See [the plugin API](docs/PLUGINS.md).
+
+## Development and tests
+
+```text
+python -m pip install -e ".[dev]"
+python -m ruff check .
+python -m pytest -p no:cacheprovider
+python -m compileall -q src scripts tests
+python -m build
+```
+
+Windows test runs create synthetic hives through Offreg and verify create/open/edit/export/reopen,
+recursive deletion, corrupt-input rejection, source immutability, and plugin subprocess access. No
+real registry evidence is stored in the repository. The CI matrix covers Windows and Ubuntu on
+Python 3.11–3.13. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Backend references
+
+- [Microsoft: About the Offline Registry Library](https://learn.microsoft.com/en-us/windows/win32/devnotes/about-the-offline-registry-library)
+- [Microsoft: Offline Registry Library functions](https://learn.microsoft.com/en-us/windows/win32/devnotes/offline-registry-library-functions)
+- [Microsoft: ORSaveHive](https://learn.microsoft.com/en-us/windows/win32/devnotes/orsavehive)

@@ -1,22 +1,35 @@
 """PySide6 GUI for registry hive editing."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-import re
-import shutil
 import tempfile
+from concurrent.futures import CancelledError
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .compare import DiffEntry, diff_entries_to_rows, diff_hives
+from .fileio import atomic_copy_file
 from .hive import Hive, HiveValue, RegistryType
-from .plugins import Plugin, load_plugins
-from .reporting import export_rows, subtree_to_rows
+from .plugins import Plugin, discover_plugins, run_plugin_subprocess, user_plugin_directory
+from .reporting import export_rows, export_subtree
+from .validation import (
+    EDITABLE_VALUE_TYPES,
+    parse_value_text,
+    validate_key_name,
+    validate_value_name,
+)
 
 PATH_ROLE = QtCore.Qt.UserRole + 1
 LOADED_ROLE = QtCore.Qt.UserRole + 2
 VALUE_NAME_ROLE = QtCore.Qt.UserRole + 3
+NODE_ROLE = QtCore.Qt.UserRole + 4
+
+SEARCH_BATCH_SIZE = 200
+MAX_SEARCH_RESULTS = 50_000
+SEARCH_RESULT_PREVIEW_CHARS = 2_048
+TABLE_VALUE_PREVIEW_CHARS = 4_096
+DETAIL_VALUE_PREVIEW_CHARS = 131_072
 
 
 @dataclass(frozen=True)
@@ -25,21 +38,37 @@ class SearchResult:
     path: str
     value_name: str | None = None
     value_data: str | None = None
+    value_data_truncated: bool = False
 
 
 class SearchWorker(QtCore.QObject):
-    results_ready = QtCore.Signal(list, bool)
-    progress = QtCore.Signal(int, int)
-    finished = QtCore.Signal()
+    results_batch = QtCore.Signal(int, list)
+    completed = QtCore.Signal(int, bool, bool, int, int)
+    progress = QtCore.Signal(int, int, int)
+    error = QtCore.Signal(int, str)
+    finished = QtCore.Signal(int)
 
-    def __init__(self, hive: Hive, query: str) -> None:
+    def __init__(
+        self,
+        hive_path: Path,
+        query: str,
+        request_id: int,
+        *,
+        max_results: int = MAX_SEARCH_RESULTS,
+    ) -> None:
         super().__init__()
-        self._hive = hive
-        self._query = query.lower()
+        self._hive_path = hive_path
+        self._query = query.casefold()
+        self._request_id = request_id
+        self._max_results = max_results
         self._cancelled = False
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    @property
+    def request_id(self) -> int:
+        return self._request_id
 
     def _should_cancel(self) -> bool:
         thread = QtCore.QThread.currentThread()
@@ -47,41 +76,70 @@ class SearchWorker(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self) -> None:
-        results: list[SearchResult] = []
+        pending: list[SearchResult] = []
         total = 0
         matched = 0
         cancelled = False
-        for path, node in self._hive.iter_key_nodes():
-            if self._should_cancel():
-                cancelled = True
-                break
-            total += 1
-            if self._query and self._query in path.lower():
-                results.append(SearchResult(kind="key", path=path))
-                matched += 1
-            for value in self._hive.iter_values_for_node(node):
-                if self._should_cancel():
-                    cancelled = True
-                    break
-                value_name = value.name or "(Default)"
-                data_text = format_value_data(value)
-                haystack = f"{value_name}\n{data_text}".lower()
-                if self._query in haystack:
-                    results.append(
-                        SearchResult(
-                            kind="value",
-                            path=path,
-                            value_name=value.name,
-                            value_data=data_text,
-                        )
-                    )
-                    matched += 1
-            if cancelled:
-                break
-            if total % 200 == 0:
-                self.progress.emit(total, matched)
-        self.results_ready.emit(results, cancelled)
-        self.finished.emit()
+        truncated = False
+        failed = False
+        try:
+            with Hive(self._hive_path, write=False) as hive:
+                for path, node in hive.iter_key_nodes():
+                    if self._should_cancel():
+                        cancelled = True
+                        break
+                    total += 1
+                    if self._query and self._query in path.casefold():
+                        pending.append(SearchResult(kind="key", path=path))
+                        matched += 1
+                        if matched >= self._max_results:
+                            truncated = True
+                            break
+                        if len(pending) >= SEARCH_BATCH_SIZE:
+                            self.results_batch.emit(self._request_id, pending)
+                            pending = []
+                    for value in hive.iter_values_for_node(node):
+                        if self._should_cancel():
+                            cancelled = True
+                            break
+                        value_name = value.name or "(Default)"
+                        data_text = format_value_data(value)
+                        haystack = f"{value_name}\n{data_text}".casefold()
+                        if self._query in haystack:
+                            preview, was_truncated = _truncate_search_preview(data_text)
+                            pending.append(
+                                SearchResult(
+                                    kind="value",
+                                    path=path,
+                                    value_name=value.name,
+                                    value_data=preview,
+                                    value_data_truncated=was_truncated,
+                                )
+                            )
+                            matched += 1
+                            if matched >= self._max_results:
+                                truncated = True
+                                break
+                        if len(pending) >= SEARCH_BATCH_SIZE:
+                            self.results_batch.emit(self._request_id, pending)
+                            pending = []
+                    if cancelled:
+                        break
+                    if truncated:
+                        break
+                    if total % 200 == 0:
+                        self.progress.emit(self._request_id, total, matched)
+        except Exception as exc:  # noqa: BLE001
+            failed = True
+            self.error.emit(self._request_id, str(exc))
+        finally:
+            if not failed:
+                if pending:
+                    self.results_batch.emit(self._request_id, pending)
+                self.completed.emit(
+                    self._request_id, cancelled, truncated, total, matched
+                )
+            self.finished.emit(self._request_id)
 
 
 class ValueEditorDialog(QtWidgets.QDialog):
@@ -101,6 +159,7 @@ class ValueEditorDialog(QtWidgets.QDialog):
         self.type_combo = QtWidgets.QComboBox()
         self.data_edit = QtWidgets.QPlainTextEdit(data_text)
         self.data_edit.setPlaceholderText("Enter value data")
+        self._parsed_value: tuple[str, RegistryType, object] | None = None
 
         for reg_type in (
             RegistryType.REG_SZ,
@@ -124,7 +183,7 @@ class ValueEditorDialog(QtWidgets.QDialog):
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -132,11 +191,22 @@ class ValueEditorDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
     def get_value(self) -> tuple[str, RegistryType, object]:
+        if self._parsed_value is not None:
+            return self._parsed_value
         name = self.name_edit.text()
+        validate_value_name(name)
         value_type = self.type_combo.currentData()
         data_text = self.data_edit.toPlainText()
         parsed = parse_value_input(value_type, data_text)
         return name, value_type, parsed
+
+    def _validate_and_accept(self) -> None:
+        try:
+            self._parsed_value = self.get_value()
+        except (TypeError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid Value", str(exc))
+            return
+        self.accept()
 
 
 class ResultsDialog(QtWidgets.QDialog):
@@ -148,10 +218,17 @@ class ResultsDialog(QtWidgets.QDialog):
 
         self._rows = rows
         self._filtered: list[dict[str, object]] = rows
+        self._searchable_rows = [
+            (row, " ".join(str(value) for value in row.values()).casefold()) for row in rows
+        ]
 
         self.filter_input = QtWidgets.QLineEdit()
         self.filter_input.setPlaceholderText("Filter results...")
-        self.filter_input.textChanged.connect(self._apply_filter)
+        self._filter_timer = QtCore.QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(200)
+        self._filter_timer.timeout.connect(self._apply_filter)
+        self.filter_input.textChanged.connect(self._schedule_filter)
 
         self.table = QtWidgets.QTableWidget()
         self.table.setSortingEnabled(True)
@@ -176,32 +253,40 @@ class ResultsDialog(QtWidgets.QDialog):
         self._load_rows(rows)
 
     def _load_rows(self, rows: list[dict[str, object]]) -> None:
+        sorting_enabled = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        self.table.setUpdatesEnabled(False)
         if not rows:
             self.table.setRowCount(0)
             self.table.setColumnCount(0)
+            self.table.setUpdatesEnabled(True)
+            self.table.setSortingEnabled(sorting_enabled)
             return
-        columns = sorted({key for row in rows for key in row.keys()})
-        self.table.setColumnCount(len(columns))
-        self.table.setHorizontalHeaderLabels(columns)
-        self.table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            for col_index, key in enumerate(columns):
-                value = row.get(key, "")
-                item = QtWidgets.QTableWidgetItem(str(value))
-                self.table.setItem(row_index, col_index, item)
-        self.table.resizeColumnsToContents()
+        try:
+            columns = sorted({key for row in rows for key in row.keys()})
+            self.table.setColumnCount(len(columns))
+            self.table.setHorizontalHeaderLabels(columns)
+            self.table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                for col_index, key in enumerate(columns):
+                    value = row.get(key, "")
+                    item = QtWidgets.QTableWidgetItem(str(value))
+                    self.table.setItem(row_index, col_index, item)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.setSortingEnabled(sorting_enabled)
+        if len(rows) <= 1_000:
+            self.table.resizeColumnsToContents()
 
-    def _apply_filter(self, text: str) -> None:
-        query = text.strip().lower()
+    def _schedule_filter(self, _text: str) -> None:
+        self._filter_timer.start()
+
+    def _apply_filter(self, text: str | None = None) -> None:
+        query = (self.filter_input.text() if text is None else text).strip().casefold()
         if not query:
             self._filtered = self._rows
         else:
-            filtered = []
-            for row in self._rows:
-                haystack = " ".join(str(value) for value in row.values()).lower()
-                if query in haystack:
-                    filtered.append(row)
-            self._filtered = filtered
+            self._filtered = [row for row, haystack in self._searchable_rows if query in haystack]
         self._load_rows(self._filtered)
 
     def _export_rows(self) -> None:
@@ -223,59 +308,91 @@ class ResultsDialog(QtWidgets.QDialog):
 
 
 class PluginWorker(QtCore.QObject):
-    results_ready = QtCore.Signal(str, list)
-    error = QtCore.Signal(str)
-    finished = QtCore.Signal()
+    results_ready = QtCore.Signal(int, str, list)
+    error = QtCore.Signal(int, str)
+    finished = QtCore.Signal(int)
 
-    def __init__(self, plugin: Plugin, hive_path: Path) -> None:
+    def __init__(self, plugin: Plugin, hive_path: Path, job_id: int) -> None:
         super().__init__()
         self._plugin = plugin
         self._hive_path = hive_path
+        self._job_id = job_id
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _should_cancel(self) -> bool:
+        thread = QtCore.QThread.currentThread()
+        return self._cancelled or (thread is not None and thread.isInterruptionRequested())
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            with Hive(self._hive_path, write=False) as hive:
-                results = self._plugin.analyze(hive)
+            results = run_plugin_subprocess(
+                self._plugin, self._hive_path, cancelled=self._should_cancel
+            )
+        except CancelledError:
+            pass
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(str(exc))
+            self.error.emit(self._job_id, str(exc))
         else:
-            self.results_ready.emit(self._plugin.name, results)
+            self.results_ready.emit(self._job_id, self._plugin.name, results)
         finally:
-            self.finished.emit()
+            self.finished.emit(self._job_id)
 
 
 class CompareWorker(QtCore.QObject):
-    results_ready = QtCore.Signal(list)
-    error = QtCore.Signal(str)
-    finished = QtCore.Signal()
+    results_ready = QtCore.Signal(int, list)
+    error = QtCore.Signal(int, str)
+    finished = QtCore.Signal(int)
 
-    def __init__(self, left_path: Path, right_path: Path) -> None:
+    def __init__(self, left_path: Path, right_path: Path, job_id: int) -> None:
         super().__init__()
         self._left_path = left_path
         self._right_path = right_path
+        self._job_id = job_id
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _should_cancel(self) -> bool:
+        thread = QtCore.QThread.currentThread()
+        return self._cancelled or (thread is not None and thread.isInterruptionRequested())
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
             with Hive(self._left_path, write=False) as left, Hive(self._right_path, write=False) as right:
-                results = diff_hives(left, right)
+                results = diff_hives(left, right, cancelled=self._should_cancel)
+        except CancelledError:
+            pass
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(str(exc))
+            self.error.emit(self._job_id, str(exc))
         else:
-            self.results_ready.emit(results)
+            self.results_ready.emit(self._job_id, results)
         finally:
-            self.finished.emit()
+            self.finished.emit(self._job_id)
 
 
 class TimelineWorker(QtCore.QObject):
-    results_ready = QtCore.Signal(list)
-    error = QtCore.Signal(str)
-    finished = QtCore.Signal()
+    results_ready = QtCore.Signal(int, list)
+    error = QtCore.Signal(int, str)
+    finished = QtCore.Signal(int)
 
-    def __init__(self, hive_path: Path) -> None:
+    def __init__(self, hive_path: Path, job_id: int) -> None:
         super().__init__()
         self._hive_path = hive_path
+        self._job_id = job_id
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _should_cancel(self) -> bool:
+        thread = QtCore.QThread.currentThread()
+        return self._cancelled or (thread is not None and thread.isInterruptionRequested())
 
     @QtCore.Slot()
     def run(self) -> None:
@@ -283,19 +400,22 @@ class TimelineWorker(QtCore.QObject):
             rows: list[dict[str, object]] = []
             with Hive(self._hive_path, write=False) as hive:
                 for path, node in hive.iter_key_nodes():
-                    timestamp = hive.get_node_timestamp(node)
+                    if self._should_cancel():
+                        return
+                    timestamp = hive.get_node_timestamp_info(node)
                     rows.append(
                         {
                             "path": path,
-                            "timestamp": timestamp.isoformat() if timestamp else "",
+                            "timestamp": timestamp.display,
+                            "timestamp_raw": timestamp.raw,
                         }
                     )
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(str(exc))
+            self.error.emit(self._job_id, str(exc))
         else:
-            self.results_ready.emit(rows)
+            self.results_ready.emit(self._job_id, rows)
         finally:
-            self.finished.emit()
+            self.finished.emit(self._job_id)
 
 
 class HiveMainWindow(QtWidgets.QMainWindow):
@@ -306,16 +426,21 @@ class HiveMainWindow(QtWidgets.QMainWindow):
 
         settings = QtCore.QSettings("reg_hive_gui", "RegHiveGUI")
         self._settings = settings
-        self._read_only = settings.value("read_only", False, type=bool)
+        self._hive_generation = 0
+        # Editing must be explicitly enabled for every application session.
+        self._read_only = True
         self._hive: Hive | None = None
         self._hive_path: Path | None = None
         self._dirty = False
+        self._edit_revision = 0
+        self._exported_revision = 0
         self._search_thread: QtCore.QThread | None = None
         self._search_worker: SearchWorker | None = None
+        self._search_generation = 0
+        self._search_temp_paths: dict[int, Path] = {}
         self._path_to_item: dict[str, QtGui.QStandardItem] = {}
         self._search_active = False
         self._search_last_count = 0
-        self._search_cancelled = False
         self._results_visible = True
         self._right_splitter_sizes: list[int] | None = None
         self._plugins: list[Plugin] = []
@@ -339,7 +464,17 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._set_ui_enabled(False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
-        self._stop_search()
+        if not self._confirm_discard_changes("Closing the application"):
+            event.ignore()
+            return
+        if not self._stop_background_jobs(wait=True):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Background Task Still Running",
+                "A background task is still stopping. Please wait a moment and close again.",
+            )
+            event.ignore()
+            return
         if self._hive is not None:
             self._hive.close()
         self._settings.setValue("results_visible", self._results_visible)
@@ -347,7 +482,6 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             self._right_splitter_sizes = self.right_splitter.sizes()
         if self._right_splitter_sizes is not None:
             self._settings.setValue("results_sizes", self._right_splitter_sizes)
-        self._settings.setValue("read_only", self._read_only)
         self._save_bookmarks()
         for path in self._temp_paths:
             try:
@@ -627,13 +761,31 @@ class HiveMainWindow(QtWidgets.QMainWindow):
 
     def _set_dirty(self, dirty: bool = True) -> None:
         self._dirty = dirty
+        if dirty:
+            self._edit_revision += 1
+        else:
+            self._edit_revision = 0
+            self._exported_revision = 0
         self._update_title()
+
+    def _has_unexported_changes(self) -> bool:
+        return self._dirty and self._edit_revision != self._exported_revision
+
+    def _confirm_discard_changes(self, action: str) -> bool:
+        if not self._has_unexported_changes():
+            return True
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Discard Unexported Changes?",
+            f"{action} will discard changes that have not been exported. Continue?",
+        )
+        return confirm == QtWidgets.QMessageBox.Yes
 
     def _update_title(self) -> None:
         if self._hive_path is None:
             self.setWindowTitle("Registry Hive GUI")
             return
-        marker = "*" if self._dirty else ""
+        marker = "*" if self._has_unexported_changes() else ""
         mode = " (Read-only)" if self._read_only else ""
         self.setWindowTitle(f"Registry Hive GUI - {self._hive_path}{marker}{mode}")
 
@@ -686,12 +838,11 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         )
 
     def _load_plugins(self) -> None:
-        root = Path(__file__).resolve().parents[2]
         search_paths = [
-            root / "plugins",
-            Path.home() / ".config" / "reg_hive_gui" / "plugins",
+            (Path(__file__).with_name("builtin_plugins"), True),
+            (user_plugin_directory(), False),
         ]
-        self._plugins = load_plugins(search_paths)
+        self._plugins, errors = discover_plugins(search_paths)
         self.plugins_menu.clear()
         if not self._plugins:
             action = QtGui.QAction("No plugins found", self)
@@ -699,9 +850,17 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             self.plugins_menu.addAction(action)
             return
         for plugin in self._plugins:
-            action = QtGui.QAction(plugin.name, self)
-            action.setToolTip(plugin.description)
+            label = plugin.name if plugin.trusted else f"External: {plugin.name}"
+            action = QtGui.QAction(label, self)
+            source = f"\nSource: {plugin.path}"
+            action.setToolTip(f"{plugin.description}{source}")
             action.triggered.connect(lambda _checked=False, p=plugin: self._run_plugin(p))
+            self.plugins_menu.addAction(action)
+        if errors:
+            self.plugins_menu.addSeparator()
+            action = QtGui.QAction(f"{len(errors)} invalid plugin(s) skipped", self)
+            action.setEnabled(False)
+            action.setToolTip("\n".join(f"{error.path}: {error.message}" for error in errors))
             self.plugins_menu.addAction(action)
 
     def _snapshot_path(self) -> Path | None:
@@ -723,15 +882,70 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._temp_paths.append(temp_path)
         return temp_path
 
+    def _cleanup_temp_path(self, path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+        if path in self._temp_paths:
+            self._temp_paths.remove(path)
+
+    @staticmethod
+    def _request_worker_stop(worker: QtCore.QObject | None, thread: QtCore.QThread | None) -> None:
+        if worker is not None:
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+        if thread is not None:
+            try:
+                thread.requestInterruption()
+                thread.quit()
+            except RuntimeError:
+                pass
+
+    def _stop_background_jobs(self, *, wait: bool) -> bool:
+        jobs = [
+            (self._search_worker, self._search_thread),
+            (self._plugin_worker, self._plugin_thread),
+            (self._compare_worker, self._compare_thread),
+            (self._timeline_worker, self._timeline_thread),
+        ]
+        for worker, thread in jobs:
+            self._request_worker_stop(worker, thread)
+        all_stopped = True
+        if wait:
+            for _worker, thread in jobs:
+                if thread is not None and thread.isRunning() and not thread.wait(5000):
+                    all_stopped = False
+        if not all_stopped:
+            return False
+
+        self._search_worker = None
+        self._search_thread = None
+        self._plugin_worker = None
+        self._plugin_thread = None
+        self._compare_worker = None
+        self._compare_thread = None
+        self._timeline_worker = None
+        self._timeline_thread = None
+        for request_id, path in list(self._search_temp_paths.items()):
+            self._cleanup_temp_path(path)
+            self._search_temp_paths.pop(request_id, None)
+        self._cleanup_temp_path(self._plugin_temp_path)
+        self._plugin_temp_path = None
+        self._cleanup_temp_path(self._compare_temp_path)
+        self._compare_temp_path = None
+        self._cleanup_temp_path(self._timeline_temp_path)
+        self._timeline_temp_path = None
+        return True
+
     def open_hive_dialog(self) -> None:
-        if self._dirty:
-            confirm = QtWidgets.QMessageBox.question(
-                self,
-                "Discard Changes?",
-                "Opening a new hive will discard unexported changes. Continue?",
-            )
-            if confirm != QtWidgets.QMessageBox.Yes:
-                return
+        if not self._confirm_discard_changes("Opening a new hive"):
+            return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Open Registry Hive",
@@ -746,20 +960,35 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         new_state = self.read_only_action.isChecked()
         if self._read_only == new_state:
             return
-        if self._dirty:
-            confirm = QtWidgets.QMessageBox.question(
+        if not new_state:
+            confirm = QtWidgets.QMessageBox.warning(
                 self,
-                "Discard Changes?",
-                "Switching read-only mode will discard unexported changes. Continue?",
+                "Enable Editing?",
+                "Editing changes an in-memory working copy. Preserve the original evidence file and "
+                "export changes to a separate verified hive. Enable editing?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
             )
             if confirm != QtWidgets.QMessageBox.Yes:
-                self.read_only_action.setChecked(self._read_only)
+                self.read_only_action.setChecked(True)
                 return
+        if not self._confirm_discard_changes("Switching read-only mode"):
+            self.read_only_action.setChecked(self._read_only)
+            return
         self._read_only = new_state
         if self._hive_path is not None:
             self.load_hive(self._hive_path)
 
     def load_hive(self, path: Path) -> None:
+        self._hive_generation += 1
+        self._search_generation += 1
+        if not self._stop_background_jobs(wait=True):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Open Hive Delayed",
+                "A background task is still stopping. Please try again in a moment.",
+            )
+            return
         try:
             new_hive = Hive(path, write=not self._read_only)
         except Exception as exc:  # noqa: BLE001
@@ -772,12 +1001,18 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._hive_path = path
         self._path_to_item.clear()
         self._dirty = False
+        self._edit_revision = 0
+        self._exported_revision = 0
+        self._last_diff_entries = []
+        self.search_results.clear()
+        self.search_status.setText("Idle")
 
         model = QtGui.QStandardItemModel()
         root_item = QtGui.QStandardItem("ROOT")
         root_item.setEditable(False)
         root_item.setData("", PATH_ROLE)
         root_item.setData(False, LOADED_ROLE)
+        root_item.setData(self._hive.get_node(""), NODE_ROLE)
         model.appendRow(root_item)
         self.tree.setModel(model)
         if self._tree_selection_model is not None:
@@ -794,7 +1029,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         self._set_ui_enabled(True)
         self._update_title()
         self._update_key_info("")
-        self.statusBar().showMessage(f"Loaded hive: {path}")
+        self.statusBar().showMessage(f"Loaded hive with {new_hive.backend_name}: {path}")
 
     def export_hive_dialog(self) -> None:
         if self._hive is None or self._hive_path is None:
@@ -809,28 +1044,34 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             return
         try:
             if self._read_only:
-                output_path = Path(path)
-                if output_path.resolve() == self._hive_path.resolve():
-                    raise ValueError("Refusing to overwrite the input hive")
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(self._hive_path, output_path)
-                output = output_path
+                output = atomic_copy_file(self._hive_path, path)
             else:
                 output = self._hive.export(path)
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Export Failed", str(exc))
             return
+        self._exported_revision = self._edit_revision
+        self._update_title()
         self.statusBar().showMessage(f"Exported hive to {output}")
 
     def export_subtree_report(self) -> None:
         if self._hive is None:
             return
-        path = self._current_path()
-        rows = subtree_to_rows(self._hive, path or None)
-        if not rows:
-            QtWidgets.QMessageBox.information(self, "Export Subtree", "No rows to export.")
+        start_path = self._current_path()
+        output_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Subtree Report",
+            str(Path.home() / "subtree_report.json"),
+            "JSON (*.json);;CSV (*.csv)",
+        )
+        if not output_path:
             return
-        self._export_rows_dialog(rows, "subtree_report")
+        try:
+            export_subtree(self._hive, start_path or None, output_path)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Export Failed", str(exc))
+            return
+        self.statusBar().showMessage(f"Exported subtree report to {output_path}")
 
     def export_search_report(self) -> None:
         rows = self._search_results_to_rows()
@@ -896,15 +1137,15 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         )
         self.statusBar().showMessage("Building timeline...")
         self._timeline_thread = QtCore.QThread(self)
-        self._timeline_worker = TimelineWorker(snapshot_path)
+        self._timeline_worker = TimelineWorker(snapshot_path, self._hive_generation)
         self._timeline_worker.moveToThread(self._timeline_thread)
         self._timeline_thread.started.connect(self._timeline_worker.run)
         self._timeline_worker.results_ready.connect(self._on_timeline_results)
         self._timeline_worker.error.connect(self._on_timeline_error)
         self._timeline_worker.finished.connect(self._timeline_thread.quit)
         self._timeline_worker.finished.connect(self._timeline_worker.deleteLater)
+        self._timeline_worker.finished.connect(self._on_timeline_finished)
         self._timeline_thread.finished.connect(self._timeline_thread.deleteLater)
-        self._timeline_thread.finished.connect(self._on_timeline_finished)
         self._timeline_thread.start()
 
     def _export_rows_dialog(self, rows: list[dict[str, object]], basename: str) -> None:
@@ -934,6 +1175,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
                     "path": result.path,
                     "value_name": result.value_name or "",
                     "value_data": result.value_data or "",
+                    "value_data_truncated": result.value_data_truncated,
                 }
             )
         return rows
@@ -944,18 +1186,20 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             return
         self.statusBar().showMessage("Comparing hives...")
         self._compare_thread = QtCore.QThread(self)
-        self._compare_worker = CompareWorker(left_path, right_path)
+        self._compare_worker = CompareWorker(left_path, right_path, self._hive_generation)
         self._compare_worker.moveToThread(self._compare_thread)
         self._compare_thread.started.connect(self._compare_worker.run)
         self._compare_worker.results_ready.connect(self._on_compare_results)
         self._compare_worker.error.connect(self._on_compare_error)
         self._compare_worker.finished.connect(self._compare_thread.quit)
         self._compare_worker.finished.connect(self._compare_worker.deleteLater)
+        self._compare_worker.finished.connect(self._on_compare_finished)
         self._compare_thread.finished.connect(self._compare_thread.deleteLater)
-        self._compare_thread.finished.connect(self._on_compare_finished)
         self._compare_thread.start()
 
-    def _on_compare_results(self, results: list[DiffEntry]) -> None:
+    def _on_compare_results(self, job_id: int, results: list[DiffEntry]) -> None:
+        if job_id != self._hive_generation:
+            return
         self._last_diff_entries = results
         self.export_diff_action.setEnabled(bool(results))
         rows = diff_entries_to_rows(results)
@@ -963,42 +1207,40 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         dialog.show()
         self.statusBar().showMessage(f"Compare complete: {len(results)} differences")
 
-    def _on_compare_error(self, message: str) -> None:
+    def _on_compare_error(self, job_id: int, message: str) -> None:
+        if job_id != self._hive_generation:
+            return
         QtWidgets.QMessageBox.critical(self, "Compare Failed", message)
         self.statusBar().showMessage("Compare failed")
 
-    def _on_compare_finished(self) -> None:
+    def _on_compare_finished(self, job_id: int) -> None:
+        if job_id != self._hive_generation:
+            return
         self._compare_worker = None
         self._compare_thread = None
-        if self._compare_temp_path is not None:
-            try:
-                self._compare_temp_path.unlink()
-            except Exception:
-                pass
-            if self._compare_temp_path in self._temp_paths:
-                self._temp_paths.remove(self._compare_temp_path)
-            self._compare_temp_path = None
+        self._cleanup_temp_path(self._compare_temp_path)
+        self._compare_temp_path = None
 
-    def _on_timeline_results(self, rows: list[dict[str, object]]) -> None:
+    def _on_timeline_results(self, job_id: int, rows: list[dict[str, object]]) -> None:
+        if job_id != self._hive_generation:
+            return
         dialog = ResultsDialog(self, "Timeline", rows)
         dialog.show()
         self.statusBar().showMessage(f"Timeline ready: {len(rows)} keys")
 
-    def _on_timeline_error(self, message: str) -> None:
+    def _on_timeline_error(self, job_id: int, message: str) -> None:
+        if job_id != self._hive_generation:
+            return
         QtWidgets.QMessageBox.critical(self, "Timeline Failed", message)
         self.statusBar().showMessage("Timeline failed")
 
-    def _on_timeline_finished(self) -> None:
+    def _on_timeline_finished(self, job_id: int) -> None:
+        if job_id != self._hive_generation:
+            return
         self._timeline_worker = None
         self._timeline_thread = None
-        if self._timeline_temp_path is not None:
-            try:
-                self._timeline_temp_path.unlink()
-            except Exception:
-                pass
-            if self._timeline_temp_path in self._temp_paths:
-                self._temp_paths.remove(self._timeline_temp_path)
-            self._timeline_temp_path = None
+        self._cleanup_temp_path(self._timeline_temp_path)
+        self._timeline_temp_path = None
 
     def _run_plugin(self, plugin: Plugin) -> None:
         if self._hive_path is None:
@@ -1006,6 +1248,17 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         if self._plugin_thread is not None:
             QtWidgets.QMessageBox.information(self, "Plugin", "A plugin is already running.")
             return
+        if not plugin.trusted:
+            confirm = QtWidgets.QMessageBox.warning(
+                self,
+                "Run External Plugin?",
+                f"Python plugins can access files and programs as your user. Run this plugin?\n\n"
+                f"{plugin.path}",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if confirm != QtWidgets.QMessageBox.Yes:
+                return
         try:
             snapshot_path = self._snapshot_path()
         except Exception as exc:  # noqa: BLE001
@@ -1018,37 +1271,39 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         )
         self.statusBar().showMessage(f"Running plugin: {plugin.name}")
         self._plugin_thread = QtCore.QThread(self)
-        self._plugin_worker = PluginWorker(plugin, snapshot_path)
+        self._plugin_worker = PluginWorker(plugin, snapshot_path, self._hive_generation)
         self._plugin_worker.moveToThread(self._plugin_thread)
         self._plugin_thread.started.connect(self._plugin_worker.run)
         self._plugin_worker.results_ready.connect(self._on_plugin_results)
         self._plugin_worker.error.connect(self._on_plugin_error)
         self._plugin_worker.finished.connect(self._plugin_thread.quit)
         self._plugin_worker.finished.connect(self._plugin_worker.deleteLater)
+        self._plugin_worker.finished.connect(self._on_plugin_finished)
         self._plugin_thread.finished.connect(self._plugin_thread.deleteLater)
-        self._plugin_thread.finished.connect(self._on_plugin_finished)
         self._plugin_thread.start()
 
-    def _on_plugin_results(self, name: str, results: list[dict[str, object]]) -> None:
+    def _on_plugin_results(
+        self, job_id: int, name: str, results: list[dict[str, object]]
+    ) -> None:
+        if job_id != self._hive_generation:
+            return
         dialog = ResultsDialog(self, f"Plugin: {name}", results)
         dialog.show()
         self.statusBar().showMessage(f"Plugin complete: {name} ({len(results)} rows)")
 
-    def _on_plugin_error(self, message: str) -> None:
+    def _on_plugin_error(self, job_id: int, message: str) -> None:
+        if job_id != self._hive_generation:
+            return
         QtWidgets.QMessageBox.critical(self, "Plugin Failed", message)
         self.statusBar().showMessage("Plugin failed")
 
-    def _on_plugin_finished(self) -> None:
+    def _on_plugin_finished(self, job_id: int) -> None:
+        if job_id != self._hive_generation:
+            return
         self._plugin_worker = None
         self._plugin_thread = None
-        if self._plugin_temp_path is not None:
-            try:
-                self._plugin_temp_path.unlink()
-            except Exception:
-                pass
-            if self._plugin_temp_path in self._temp_paths:
-                self._temp_paths.remove(self._plugin_temp_path)
-            self._plugin_temp_path = None
+        self._cleanup_temp_path(self._plugin_temp_path)
+        self._plugin_temp_path = None
 
     def _populate_item(self, item: QtGui.QStandardItem) -> None:
         if self._hive is None:
@@ -1063,18 +1318,26 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         else:
             prefix = f"{path}\\"
             for existing in list(self._path_to_item):
-                if existing == path or existing.startswith(prefix):
+                if existing.startswith(prefix):
                     self._path_to_item.pop(existing, None)
         item.removeRows(0, item.rowCount())
-        subkeys = self._hive.list_subkeys(path)
-        for name in sorted(subkeys, key=str.casefold):
+        node = item.data(NODE_ROLE)
+        if node is None:
+            node = self._hive.get_node(path)
+        if node is None:
+            item.setData(True, LOADED_ROLE)
+            return
+        item.setData(node, NODE_ROLE)
+        subkeys = sorted(self._hive.iter_subkeys_for_node(node), key=lambda child: child[0].casefold())
+        for name, child_node, has_children in subkeys:
             child_item = QtGui.QStandardItem(name)
             child_item.setEditable(False)
             child_path = f"{path}\\{name}" if path else name
             child_item.setData(child_path, PATH_ROLE)
             child_item.setData(False, LOADED_ROLE)
+            child_item.setData(child_node, NODE_ROLE)
             self._path_to_item[child_path] = child_item
-            if self._hive.list_subkeys(child_path):
+            if has_children:
                 child_item.appendRow(QtGui.QStandardItem(""))
             item.appendRow(child_item)
         item.setData(True, LOADED_ROLE)
@@ -1098,17 +1361,25 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         if self._hive is None:
             return
         values = list(self._hive.list_values(path))
-        self.values_table.setRowCount(len(values))
-        for row, value in enumerate(values):
-            name_display = value.name if value.name else "(Default)"
-            name_item = QtWidgets.QTableWidgetItem(name_display)
-            name_item.setData(VALUE_NAME_ROLE, value.name)
-            type_item = QtWidgets.QTableWidgetItem(value.type_name)
-            data_item = QtWidgets.QTableWidgetItem(format_value_data(value))
-            self.values_table.setItem(row, 0, name_item)
-            self.values_table.setItem(row, 1, type_item)
-            self.values_table.setItem(row, 2, data_item)
-        self.values_table.resizeColumnsToContents()
+        self.values_table.setUpdatesEnabled(False)
+        try:
+            self.values_table.setRowCount(len(values))
+            for row, value in enumerate(values):
+                name_display = value.name if value.name else "(Default)"
+                name_item = QtWidgets.QTableWidgetItem(name_display)
+                name_item.setData(VALUE_NAME_ROLE, value.name)
+                type_item = QtWidgets.QTableWidgetItem(value.type_name)
+                data_text, _truncated = _truncate_text(
+                    format_value_data(value), TABLE_VALUE_PREVIEW_CHARS
+                )
+                data_item = QtWidgets.QTableWidgetItem(data_text)
+                self.values_table.setItem(row, 0, name_item)
+                self.values_table.setItem(row, 1, type_item)
+                self.values_table.setItem(row, 2, data_item)
+        finally:
+            self.values_table.setUpdatesEnabled(True)
+        if len(values) <= 1_000:
+            self.values_table.resizeColumnsToContents()
         self.statusBar().showMessage(f"{path or 'ROOT'}: {len(values)} values")
         self._update_value_details(None)
 
@@ -1145,14 +1416,22 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             decoded_text = value.decoded.hex(" ")
         else:
             decoded_text = str(value.decoded)
-        self.value_decoded.setPlainText(decoded_text)
-        self.value_raw.setPlainText(value.data.hex(" "))
+        raw_text = value.data.hex(" ")
+        decoded_preview, decoded_truncated = _truncate_text(
+            decoded_text, DETAIL_VALUE_PREVIEW_CHARS
+        )
+        raw_preview, raw_truncated = _truncate_text(raw_text, DETAIL_VALUE_PREVIEW_CHARS)
+        if decoded_truncated or raw_truncated:
+            meta += " | Display preview truncated; Copy Value Data retains the complete value"
+            self.value_meta.setText(meta)
+        self.value_decoded.setPlainText(decoded_preview)
+        self.value_raw.setPlainText(raw_preview)
 
     def _update_key_info(self, path: str | None) -> None:
         path = path or ""
         display_path = path if path else "ROOT"
-        timestamp = self._hive.get_key_timestamp(path) if self._hive is not None else None
-        time_text = timestamp.isoformat() if timestamp else "-"
+        timestamp = self._hive.get_key_timestamp_info(path) if self._hive is not None else None
+        time_text = timestamp.display if timestamp and timestamp.display else "-"
         self.key_path_label.setText(f"Path: {display_path}")
         self.key_time_label.setText(f"Last write: {time_text}")
         self._sync_bookmark_toggle(path)
@@ -1201,14 +1480,14 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         path = item.data(PATH_ROLE)
         menu = QtWidgets.QMenu(self)
         new_action = menu.addAction("New Key")
-        rename_action = menu.addAction("Rename Key")
+        rename_action = menu.addAction("Rename Key (disabled for metadata safety)")
         delete_action = menu.addAction("Delete Key")
         menu.addSeparator()
         copy_action = menu.addAction("Copy Path")
         bookmark_action = menu.addAction("Add Bookmark" if path not in self._bookmarks else "Remove Bookmark")
 
         is_root = path == ""
-        rename_action.setEnabled(not is_root and not self._read_only)
+        rename_action.setEnabled(False)
         delete_action.setEnabled(not is_root and not self._read_only)
         new_action.setEnabled(not self._read_only)
 
@@ -1257,8 +1536,12 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             name_item = self.values_table.item(index.row(), 0)
             QtWidgets.QApplication.clipboard().setText(name_item.text())
         elif action == copy_data_action:
-            data_item = self.values_table.item(index.row(), 2)
-            QtWidgets.QApplication.clipboard().setText(data_item.text())
+            name_item = self.values_table.item(index.row(), 0)
+            if name_item is not None:
+                value_name = name_item.data(VALUE_NAME_ROLE) or ""
+                value = self._hive.get_value(self._current_path(), value_name)
+                if value is not None:
+                    QtWidgets.QApplication.clipboard().setText(format_value_data(value))
 
     def _create_key(self, parent_path: str) -> None:
         if self._hive is None:
@@ -1266,9 +1549,16 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         if self._read_only:
             QtWidgets.QMessageBox.information(self, "Read-only", "Hive is read-only.")
             return
-        name, ok = QtWidgets.QInputDialog.getText(self, "New Key", "Key name")
-        if not ok or not name:
-            return
+        while True:
+            name, ok = QtWidgets.QInputDialog.getText(self, "New Key", "Key name")
+            if not ok:
+                return
+            try:
+                validate_key_name(name)
+            except (TypeError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(self, "Invalid Key Name", str(exc))
+                continue
+            break
         new_path = f"{parent_path}\\{name}" if parent_path else name
         try:
             self._hive.create_key(new_path)
@@ -1283,34 +1573,12 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             self._set_dirty(True)
 
     def _rename_key(self, path: str) -> None:
-        if self._hive is None:
-            return
-        if self._read_only:
-            QtWidgets.QMessageBox.information(self, "Read-only", "Hive is read-only.")
-            return
-        parts = path.split("\\") if path else []
-        current_name = parts[-1] if parts else ""
-        new_name, ok = QtWidgets.QInputDialog.getText(
-            self, "Rename Key", "New key name", text=current_name
+        QtWidgets.QMessageBox.information(
+            self,
+            "Rename Key Disabled",
+            "Key rename is disabled because the current backend cannot preserve timestamps, "
+            "class data, and security metadata safely.",
         )
-        if not ok or not new_name or new_name == current_name:
-            return
-        try:
-            success = self._hive.rename_key(path, new_name)
-        except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Rename Failed", str(exc))
-            return
-        if not success:
-            QtWidgets.QMessageBox.warning(self, "Rename Failed", "Key not found.")
-            return
-        parent_path = "\\".join(parts[:-1])
-        parent_item = self._path_to_item.get(parent_path) if parent_path else self.tree.model().item(0)
-        if parent_item is not None:
-            parent_item.setData(False, LOADED_ROLE)
-            self._populate_item(parent_item)
-            new_path = f"{parent_path}\\{new_name}" if parent_path else new_name
-            self._select_path(new_path)
-            self._set_dirty(True)
 
     def _delete_key(self, path: str) -> None:
         if self._hive is None:
@@ -1353,7 +1621,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             return
         try:
             name, value_type, parsed = dialog.get_value()
-            self._hive.set_value(path, name, value_type, parsed)
+            self._hive.create_value(path, name, value_type, parsed)
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Add Value Failed", str(exc))
             return
@@ -1375,19 +1643,21 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         if value is None:
             QtWidgets.QMessageBox.warning(self, "Edit Failed", "Value not found.")
             return
+        if value.type not in EDITABLE_VALUE_TYPES:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Unsupported Registry Type",
+                f"{value.type_name} is preserved as raw bytes but cannot be edited safely.",
+            )
+            return
         data_text = format_value_edit_text(value)
-        try:
-            reg_type = RegistryType(value.type)
-        except ValueError:
-            reg_type = RegistryType.REG_BINARY
+        reg_type = RegistryType(value.type)
         dialog = ValueEditorDialog(self, "Edit Value", value.name, reg_type, data_text)
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         try:
             name, value_type, parsed = dialog.get_value()
-            if name != value.name:
-                self._hive.delete_value(path, value.name)
-            self._hive.set_value(path, name, value_type, parsed)
+            self._hive.replace_value(path, value.name, name, value_type, parsed)
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Edit Value Failed", str(exc))
             return
@@ -1446,7 +1716,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
             next_item = None
             for row in range(item.rowCount()):
                 child = item.child(row)
-                if child.text() == part:
+                if child.text().casefold() == part.casefold():
                     next_item = child
                     break
             if next_item is None:
@@ -1461,57 +1731,86 @@ class HiveMainWindow(QtWidgets.QMainWindow):
         return False
 
     def _start_search(self) -> None:
-        if self._hive is None:
+        if self._hive is None or self._hive_path is None:
             return
         query = self.search_input.text().strip()
         if not query:
             return
-        self._stop_search()
+        self._search_generation += 1
+        request_id = self._search_generation
+        if not self._stop_search(wait=True):
+            self.search_status.setText("Previous search is still stopping")
+            return
+        try:
+            snapshot_path = self._snapshot_path()
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Search Failed", str(exc))
+            return
+        if snapshot_path is None:
+            return
+        if snapshot_path != self._hive_path:
+            self._search_temp_paths[request_id] = snapshot_path
         self.search_results.clear()
         self.export_search_action.setEnabled(False)
         self._search_active = True
         self._search_last_count = 0
-        self._search_cancelled = False
         self.search_cancel_button.setEnabled(True)
         self.search_status.setText("Searching...")
         self.statusBar().showMessage("Searching...")
         self._search_thread = QtCore.QThread(self)
-        self._search_worker = SearchWorker(self._hive, query)
+        self._search_worker = SearchWorker(snapshot_path, query, request_id)
         self._search_worker.moveToThread(self._search_thread)
         self._search_thread.started.connect(self._search_worker.run)
-        self._search_worker.results_ready.connect(self._on_search_results)
+        self._search_worker.results_batch.connect(self._on_search_batch)
+        self._search_worker.completed.connect(self._on_search_completed)
         self._search_worker.progress.connect(self._on_search_progress)
+        self._search_worker.error.connect(self._on_search_error)
         self._search_worker.finished.connect(self._search_thread.quit)
         self._search_worker.finished.connect(self._search_worker.deleteLater)
         self._search_thread.finished.connect(self._search_thread.deleteLater)
-        self._search_thread.finished.connect(self._on_search_finished)
+        self._search_worker.finished.connect(self._on_search_finished)
         self._search_thread.start()
 
-    def _stop_search(self) -> None:
-        if self._search_worker is not None:
-            self._search_worker.cancel()
-        if self._search_thread is not None:
-            self._search_thread.requestInterruption()
-            try:
-                self._search_thread.quit()
-            except RuntimeError:
-                pass
+    def _stop_search(self, *, wait: bool = False) -> bool:
+        worker = self._search_worker
+        thread = self._search_thread
+        self._request_worker_stop(worker, thread)
+        if wait and thread is not None and thread.isRunning() and not thread.wait(5000):
+            return False
+        if wait:
+            self._search_worker = None
+            self._search_thread = None
+            if worker is not None:
+                request_id = worker.request_id
+                self._cleanup_temp_path(self._search_temp_paths.pop(request_id, None))
+        return True
 
-    def _on_search_finished(self) -> None:
+    def _on_search_finished(self, request_id: int) -> None:
+        self._cleanup_temp_path(self._search_temp_paths.pop(request_id, None))
+        if request_id != self._search_generation:
+            return
         self._search_worker = None
         self._search_thread = None
         self._search_active = False
         self.search_cancel_button.setEnabled(False)
-        if not self._search_last_count and not self._search_cancelled:
-            self.search_status.setText("Idle")
 
-    def _on_search_progress(self, total: int, matched: int) -> None:
+    def _on_search_progress(self, request_id: int, total: int, matched: int) -> None:
+        if request_id != self._search_generation:
+            return
         self.statusBar().showMessage(f"Searching... scanned {total} keys, {matched} matches")
         self.search_status.setText(f"Scanned {total} keys, {matched} matches")
 
-    def _on_search_results(self, results: list[SearchResult], cancelled: bool) -> None:
-        self._search_last_count = len(results)
-        self._search_cancelled = cancelled
+    def _on_search_error(self, request_id: int, message: str) -> None:
+        if request_id != self._search_generation:
+            return
+        QtWidgets.QMessageBox.critical(self, "Search Failed", message)
+        self.search_status.setText("Search failed")
+        self.statusBar().showMessage("Search failed")
+
+    def _on_search_batch(self, request_id: int, results: list[SearchResult]) -> None:
+        if request_id != self._search_generation:
+            return
+        self.search_results.setUpdatesEnabled(False)
         for result in results:
             if result.kind == "key":
                 label = f"[Key] {result.path}"
@@ -1520,16 +1819,35 @@ class HiveMainWindow(QtWidgets.QMainWindow):
                 label = f"[Value] {result.path} \\ {value_name}"
                 if result.value_data:
                     label += f" = {result.value_data}"
+                    if result.value_data_truncated:
+                        label += " … [preview truncated]"
             item = QtWidgets.QListWidgetItem(label)
             item.setData(QtCore.Qt.UserRole, result)
             self.search_results.addItem(item)
-        self.export_search_action.setEnabled(bool(results))
+        self.search_results.setUpdatesEnabled(True)
+        self._search_last_count += len(results)
+        self.export_search_action.setEnabled(self._search_last_count > 0)
+
+    def _on_search_completed(
+        self,
+        request_id: int,
+        cancelled: bool,
+        truncated: bool,
+        total: int,
+        matched: int,
+    ) -> None:
+        if request_id != self._search_generation:
+            return
         if cancelled:
-            self.search_status.setText(f"Cancelled ({len(results)} results)")
-            self.statusBar().showMessage(f"Search cancelled: {len(results)} results")
+            self.search_status.setText(f"Cancelled ({matched} results)")
+            self.statusBar().showMessage(f"Search cancelled: {matched} results")
+        elif truncated:
+            message = f"Result limit reached: {matched} matches in {total} keys; narrow the search"
+            self.search_status.setText(message)
+            self.statusBar().showMessage(message)
         else:
-            self.search_status.setText(f"Results: {len(results)}")
-            self.statusBar().showMessage(f"Search complete: {len(results)} results")
+            self.search_status.setText(f"Results: {matched}")
+            self.statusBar().showMessage(f"Search complete: {matched} results")
 
     def _cancel_search(self) -> None:
         if not self._search_active:
@@ -1626,7 +1944,7 @@ class HiveMainWindow(QtWidgets.QMainWindow):
     def _highlight_value(self, value_name: str) -> None:
         for row in range(self.values_table.rowCount()):
             item = self.values_table.item(row, 0)
-            if item and item.data(VALUE_NAME_ROLE) == value_name:
+            if item and str(item.data(VALUE_NAME_ROLE)).casefold() == value_name.casefold():
                 self.values_table.selectRow(row)
                 return
 
@@ -1647,6 +1965,18 @@ def format_value_data(value: HiveValue) -> str:
     return str(value.decoded)
 
 
+def _truncate_search_preview(text: str) -> tuple[str, bool]:
+    if len(text) <= SEARCH_RESULT_PREVIEW_CHARS:
+        return text, False
+    return text[:SEARCH_RESULT_PREVIEW_CHARS], True
+
+
+def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    return f"{text[:limit]} … [truncated]", True
+
+
 def format_value_edit_text(value: HiveValue) -> str:
     if value.type == RegistryType.REG_MULTI_SZ:
         if isinstance(value.decoded, list):
@@ -1658,17 +1988,4 @@ def format_value_edit_text(value: HiveValue) -> str:
 
 
 def parse_value_input(value_type: RegistryType, text: str) -> object:
-    if value_type == RegistryType.REG_MULTI_SZ:
-        return [line for line in text.splitlines() if line.strip()]
-    if value_type == RegistryType.REG_DWORD:
-        cleaned = text.strip()
-        return int(cleaned, 0) if cleaned else 0
-    if value_type == RegistryType.REG_QWORD:
-        cleaned = text.strip()
-        return int(cleaned, 0) if cleaned else 0
-    if value_type == RegistryType.REG_BINARY:
-        cleaned = re.sub(r"[^0-9a-fA-F]", "", text)
-        if len(cleaned) % 2 != 0:
-            raise ValueError("Binary hex must contain an even number of digits")
-        return bytes.fromhex(cleaned) if cleaned else b""
-    return text
+    return parse_value_text(int(value_type), text)
